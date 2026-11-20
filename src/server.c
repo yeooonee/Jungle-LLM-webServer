@@ -40,16 +40,56 @@ int main(void) {
         ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
         if (n > 0) {
             buf[n] = '\0';
-            printf("--- request ---\n%s\n", buf);
 
-            // 5-2. write: 고정 응답 보내기
-            const char *res =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: 13\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "Hello, World!";
+            // 파싱 ① 요청 라인: "GET /index.html HTTP/1.1" → 공백 기준 3조각
+            char method[16], path[1024], version[16];
+            int ok = sscanf(buf, "%15s %1023s %15s", method, path, version) == 3;
+
+            // 파싱 ② 헤더: 첫 줄 다음부터 빈 줄(\r\n\r\n)까지 "이름: 값"
+            if (ok) {
+                printf("--- %s %s %s ---\n", method, path, version);
+                char *line = strstr(buf, "\r\n");
+                if (line) line += 2;                               // 요청 라인 건너뛰기
+                while (line && strncmp(line, "\r\n", 2) != 0) {    // 빈 줄 = 헤더 끝
+                    char *end = strstr(line, "\r\n");
+                    if (!end) break;                               // 줄이 잘려서 옴 (read 1번 한계)
+                    char *colon = memchr(line, ':', end - line);
+                    if (colon) {
+                        char *value = colon + 1;
+                        while (*value == ' ') value++;             // ":" 뒤 공백 건너뛰기
+                        printf("  [%.*s] = [%.*s]\n",
+                               (int)(colon - line), line, (int)(end - value), value);
+                    }
+                    line = end + 2;                                // 다음 줄로
+                }
+            }
+
+            // 처리: 파싱 결과(경로)에 따라 응답 고르기
+            const char *res;
+            if (!ok) {
+                res = "HTTP/1.1 400 Bad Request\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 11\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "Bad Request";
+            } else if (strcmp(path, "/") == 0) {
+                res = "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 13\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "Hello, World!";
+            } else {
+                res = "HTTP/1.1 404 Not Found\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 9\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "Not Found";
+            }
+
+            // 5-2. write: 고른 응답 보내기
             write(client_fd, res, strlen(res));
         }
 
