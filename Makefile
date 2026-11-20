@@ -40,7 +40,7 @@ CPPFLAGS := $(BASE_CPPFLAGS) $(PLATFORM_CPPFLAGS) $(EXTRA_CPPFLAGS)
 CFLAGS   := $(BASE_CFLAGS) $(MODE_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS  := $(BASE_LDFLAGS) $(MODE_LDFLAGS) $(EXTRA_LDFLAGS)
 
-.PHONY: all debug release asan test clean help
+.PHONY: all debug release asan test test-integration clean help
 
 all: $(TARGET)
 
@@ -78,12 +78,16 @@ test:
 clean:
 	rm -rf $(BUILD_DIR)
 
+test-integration: $(TARGET)
+	python3 tests/integration/test_tcp.py $(TARGET)
+
 help:
 	@echo "Targets:"
 	@echo "  make          Build default debug binary ($(BUILD_DIR)/webserver)"
 	@echo "  make release  Build optimized binary ($(BUILD_DIR)/webserver-release)"
 	@echo "  make asan     Build with ASan + UBSan ($(BUILD_DIR)/webserver-asan)"
 	@echo "  make test     Build and run unit tests in tests/unit/"
+	@echo "  make test-integration  Run TCP integration checks (Python 3 required)"
 	@echo "  make clean    Remove build artifacts"
 
 -include $(DEPS)
