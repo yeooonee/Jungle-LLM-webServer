@@ -52,6 +52,7 @@ int main(void) {
             char method[16], path[1024], version[16];
             int ok = header_end && sscanf(buf, "%15s %1023s %15s", method, path, version) == 3;
             long content_length = 0;
+            int has_te = 0;                                        // Transfer-Encoding 헤더가 있었는지
 
             // 파싱 ② 헤더: 첫 줄 다음부터 빈 줄(\r\n\r\n)까지 "이름: 값"
             if (ok) {
@@ -69,6 +70,9 @@ int main(void) {
                                (int)(colon - line), line, (int)(end - value), value);
                         if (colon - line == 14 && strncasecmp(line, "Content-Length", 14) == 0)
                             content_length = strtol(value, NULL, 10);
+                        // shortcut: chunked 미지원 → 501로 거절, 스트림 업로드가 필요해지면 [C]를 chunk 읽기로 교체
+                        if (colon - line == 17 && strncasecmp(line, "Transfer-Encoding", 17) == 0)
+                            has_te = 1;
                     }
                     line = end + 2;                                // 다음 줄로
                 }
@@ -76,7 +80,7 @@ int main(void) {
 
             // 파싱 ③ 본문: 문자로 자르지 않고 Content-Length 바이트만큼 모일 때까지 read 반복
             int too_big = 0;
-            if (ok) {
+            if (ok && !has_te) {                                   // TE가 있으면 본문 길이를 모르니 읽지 않음
                 char *body = header_end + 4;                       // 빈 줄 바로 다음이 본문 시작
                 size_t room = sizeof(buf) - 1 - (body - buf);      // 본문이 들어갈 남은 공간
                 size_t have = total - (body - buf);                // 헤더와 같이 이미 도착한 본문
@@ -103,6 +107,13 @@ int main(void) {
                       "Connection: close\r\n"
                       "\r\n"
                       "Payload Too Large";
+            } else if (has_te) {
+                res = "HTTP/1.1 501 Not Implemented\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 15\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "Not Implemented";
             } else if (!ok) {
                 res = "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: text/plain\r\n"
