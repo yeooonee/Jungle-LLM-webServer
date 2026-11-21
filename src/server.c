@@ -10,6 +10,21 @@
 #define PORT 8080
 #define BACKLOG 10   // listen 대기열 길이
 
+// 상태 코드·문구·본문만 받아 응답 조립 (Content-Length는 손으로 세지 않고 계산)
+// shortcut: 본문을 strlen으로 재서 텍스트만 가능, 파일(바이너리) 서빙 때 길이 인자 추가
+static void send_response(int fd, int code, const char *reason, const char *body) {
+    char header[256];
+    int len = snprintf(header, sizeof(header),
+                       "HTTP/1.1 %d %s\r\n"
+                       "Content-Type: text/plain\r\n"
+                       "Content-Length: %zu\r\n"
+                       "Connection: close\r\n"
+                       "\r\n",
+                       code, reason, strlen(body));
+    write(fd, header, len);
+    write(fd, body, strlen(body));
+}
+
 int main(void) {
     // 1. socket: 메인 소켓 생성
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -104,63 +119,23 @@ int main(void) {
                 }
             }
 
-            // 처리: 파싱 결과(경로)에 따라 응답 고르기
-            const char *res;
-            if (too_big) {
-                res = "HTTP/1.1 413 Payload Too Large\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 17\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "Payload Too Large";
-            } else if (has_te) {
-                res = "HTTP/1.1 501 Not Implemented\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 15\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "Not Implemented";
-            } else if (!ok) {
-                res = "HTTP/1.1 400 Bad Request\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 11\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "Bad Request";
-            } else if (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0) {
-                // 형식은 맞지만 지원 안 하는 버전 (예: HTTP/2.0, HTTP/9.9) → 505
-                res = "HTTP/1.1 505 HTTP Version Not Supported\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 26\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "HTTP Version Not Supported";
-            } else if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) {
-                // 어떤 경로에서도 구현 안 한 메서드 → 501 (RFC 9110). 405는 경로별로 허용이 갈릴 때(Day 2~)
-                res = "HTTP/1.1 501 Not Implemented\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 15\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "Not Implemented";
-            } else if (strcmp(path, "/") == 0) {
-                res = "HTTP/1.1 200 OK\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 13\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "Hello, World!";
-            } else {
-                res = "HTTP/1.1 404 Not Found\r\n"
-                      "Content-Type: text/plain\r\n"
-                      "Content-Length: 9\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "Not Found";
-            }
-
-            // 5-2. write: 고른 응답 보내기
-            write(client_fd, res, strlen(res));
+            // 처리 + 5-2. write: 파싱 결과(경로)에 따라 응답 골라 보내기
+            if (too_big)
+                send_response(client_fd, 413, "Payload Too Large", "Payload Too Large");
+            else if (has_te)
+                send_response(client_fd, 501, "Not Implemented", "Not Implemented");
+            else if (!ok)
+                send_response(client_fd, 400, "Bad Request", "Bad Request");
+            // 형식은 맞지만 지원 안 하는 버전 (예: HTTP/2.0, HTTP/9.9) → 505
+            else if (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0)
+                send_response(client_fd, 505, "HTTP Version Not Supported", "HTTP Version Not Supported");
+            // 어떤 경로에서도 구현 안 한 메서드 → 501 (RFC 9110). 405는 경로별로 허용이 갈릴 때(Day 2~)
+            else if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0)
+                send_response(client_fd, 501, "Not Implemented", "Not Implemented");
+            else if (strcmp(path, "/") == 0)
+                send_response(client_fd, 200, "OK", "Hello, World!");
+            else
+                send_response(client_fd, 404, "Not Found", "Not Found");
         }
 
         // 6. close: 하위 소켓만 닫음 (메인 소켓은 계속 손님 받음)
