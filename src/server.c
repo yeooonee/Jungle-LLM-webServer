@@ -1,4 +1,5 @@
 // Day 1 최소 TCP 서버: socket → bind → listen (1번) / accept → read/write → close (반복)
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,11 @@ int main(void) {
             // 파싱 ① 요청 라인: "GET /index.html HTTP/1.1" → 공백 기준 3조각
             char method[16], path[1024], version[16];
             int ok = header_end && sscanf(buf, "%15s %1023s %15s", method, path, version) == 3;
+            // 버전이 "HTTP/숫자.숫자" 형식이 아니면 요청 라인이 깨진 것 → 400 (RFC 9112)
+            if (ok && !(strlen(version) == 8 && strncmp(version, "HTTP/", 5) == 0 &&
+                        isdigit((unsigned char)version[5]) && version[6] == '.' &&
+                        isdigit((unsigned char)version[7])))
+                ok = 0;
             long content_length = 0;
             int has_te = 0;                                        // Transfer-Encoding 헤더가 있었는지
 
@@ -121,6 +127,14 @@ int main(void) {
                       "Connection: close\r\n"
                       "\r\n"
                       "Bad Request";
+            } else if (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0) {
+                // 형식은 맞지만 지원 안 하는 버전 (예: HTTP/2.0, HTTP/9.9) → 505
+                res = "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 26\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "HTTP Version Not Supported";
             } else if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) {
                 // 어떤 경로에서도 구현 안 한 메서드 → 501 (RFC 9110). 405는 경로별로 허용이 갈릴 때(Day 2~)
                 res = "HTTP/1.1 501 Not Implemented\r\n"
