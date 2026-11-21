@@ -121,6 +121,14 @@ int main(void) {
                       "Connection: close\r\n"
                       "\r\n"
                       "Bad Request";
+            } else if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0) {
+                // 어떤 경로에서도 구현 안 한 메서드 → 501 (RFC 9110). 405는 경로별로 허용이 갈릴 때(Day 2~)
+                res = "HTTP/1.1 501 Not Implemented\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 15\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "Not Implemented";
             } else if (strcmp(path, "/") == 0) {
                 res = "HTTP/1.1 200 OK\r\n"
                       "Content-Type: text/plain\r\n"
