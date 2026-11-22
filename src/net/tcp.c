@@ -10,6 +10,31 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+int tcp_send_all(int socket_fd, const void *data, size_t length,
+                 const volatile sig_atomic_t *stopping) {
+  const char *buffer = data;
+  size_t sent = 0;
+  while (sent < length) {
+    if (*stopping) {
+      errno = ECANCELED;
+      return -1;
+    }
+    ssize_t count = send(socket_fd, buffer + sent, length - sent, 0);
+    if (count < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      return -1;
+    }
+    if (count == 0) {
+      errno = EIO;
+      return -1;
+    }
+    sent += (size_t)count;
+  }
+  return 0;
+}
+
 static int echo_client(int client, const volatile sig_atomic_t *stopping) {
   /* I/O 직전에 종료 시그널이 도착해도 무한히 기다리지 않도록 대기 시간을 제한.
    */
@@ -32,20 +57,8 @@ static int echo_client(int client, const volatile sig_atomic_t *stopping) {
       }
       return -1;
     }
-    size_t sent = 0;
-    while (sent < (size_t)received && !*stopping) {
-      ssize_t count = send(client, buffer + sent, (size_t)received - sent, 0);
-      if (count < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-          continue;
-        }
-        return -1;
-      }
-      if (count == 0) {
-        errno = EIO;
-        return -1;
-      }
-      sent += (size_t)count;
+    if (tcp_send_all(client, buffer, (size_t)received, stopping) == -1) {
+      return -1;
     }
   }
   return 0;
