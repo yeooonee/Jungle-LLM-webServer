@@ -71,7 +71,7 @@ test:
 		for t in $(UNIT_SRCS); do \
 			bin="$(BUILD_DIR)/tests/$$(basename $$t .c)"; \
 			mkdir -p "$(BUILD_DIR)/tests"; \
-			$(CC) $(CPPFLAGS) $(BASE_CFLAGS) -O0 -g "$$t" $(filter-out $(SRC_DIR)/main.c,$(SRCS)) -o "$$bin" $(BASE_LDFLAGS) && "$$bin" || exit 1; \
+			$(CC) $(CPPFLAGS) $(filter-out -DNDEBUG,$(CFLAGS)) "$$t" $(filter-out $(SRC_DIR)/main.c,$(SRCS)) -o "$$bin" $(LDFLAGS) && "$$bin" || exit 1; \
 		done; \
 	fi
 
