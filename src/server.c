@@ -74,6 +74,7 @@ int main(void) {
                 ok = 0;
             long content_length = 0;
             int has_te = 0;                                        // Transfer-Encoding 헤더가 있었는지
+            int has_host = 0;                                      // Host 헤더가 있었는지
 
             // 파싱 ② 헤더: 첫 줄 다음부터 빈 줄(\r\n\r\n)까지 "이름: 값"
             if (ok) {
@@ -94,9 +95,13 @@ int main(void) {
                         // shortcut: chunked 미지원 → 501로 거절, 스트림 업로드가 필요해지면 [C]를 chunk 읽기로 교체
                         if (colon - line == 17 && strncasecmp(line, "Transfer-Encoding", 17) == 0)
                             has_te = 1;
+                        if (colon - line == 4 && strncasecmp(line, "Host", 4) == 0)
+                            has_host = 1;
                     }
                     line = end + 2;                                // 다음 줄로
                 }
+                // HTTP/1.1은 Host 필수, 없으면 400 (RFC 9112 3.2). HTTP/1.0은 선택
+                if (!has_host && strcmp(version, "HTTP/1.1") == 0) ok = 0;
             }
 
             // 파싱 ③ 본문: 문자로 자르지 않고 Content-Length 바이트만큼 모일 때까지 read 반복
