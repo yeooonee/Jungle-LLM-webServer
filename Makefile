@@ -3,9 +3,11 @@ CFLAGS = -Wall -Wextra
 
 all: build/server build/server_copy
 
-build/server: src/server.c
+SRCS = src/main.c src/http.c src/static.c
+
+build/server: $(SRCS) src/http.h src/static.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
 # SO_REUSEADDR 끈 실험용 (포트 8070)
 build/server_copy: experiments/server_copy.c
