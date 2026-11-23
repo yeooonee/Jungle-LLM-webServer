@@ -1,5 +1,6 @@
 #include "http.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -151,7 +152,44 @@ static bool parse_connection(char *value, struct http_request *request)
     return true;
 }
 
-int http_parse_headers(char *headers, struct http_request *request)
+static bool if_none_match_contains(const char *value, const char *etag)
+{
+    if (strcmp(value, "*") == 0) {
+        return true;
+    }
+
+    size_t etag_length = strlen(etag);
+    bool matches = false;
+    for (;;) {
+        value += strspn(value, " \t,");
+        if (*value == '\0') {
+            return matches;
+        }
+        // If-None-Match uses weak comparison, so compare the quoted tags.
+        if (strncmp(value, "W/", 2) == 0) {
+            value += 2;
+        }
+        if (*value != '"') {
+            return false;
+        }
+        const char *end = strchr(value + 1, '"');
+        if (end == NULL) {
+            return false;
+        }
+        if ((size_t)(end - value + 1) == etag_length &&
+            memcmp(value, etag, etag_length) == 0) {
+            matches = true;
+        }
+        value = end + 1;
+        value += strspn(value, " \t");
+        if (*value != ',' && *value != '\0') {
+            return false;
+        }
+    }
+}
+
+int http_parse_headers(char *headers, struct http_request *request,
+                       const char *etag)
 {
     char *line = next_line(&headers);
     if (line == NULL) {
@@ -164,7 +202,7 @@ int http_parse_headers(char *headers, struct http_request *request)
 
     bool has_length = false;
     bool has_transfer_encoding = false;
-    bool has_expectation = false;
+    bool unsupported_expectation = false;
 
     while ((line = next_line(&headers)) != NULL && *line) {
         char *value = strchr(line, ':');
@@ -198,7 +236,15 @@ int http_parse_headers(char *headers, struct http_request *request)
         } else if (strcasecmp(line, "Transfer-Encoding") == 0) {
             has_transfer_encoding = true;
         } else if (strcasecmp(line, "Expect") == 0 && *value) {
-            has_expectation = true;
+            if (strcasecmp(value, "100-continue") == 0) {
+                request->expect_continue = strcmp(request->version, "HTTP/1.1") == 0;
+            } else {
+                unsupported_expectation = true;
+            }
+        } else if (strcasecmp(line, "If-None-Match") == 0 && etag != NULL) {
+            if (if_none_match_contains(value, etag)) {
+                request->etag_matches = true;
+            }
         }
     }
 
@@ -209,7 +255,7 @@ int http_parse_headers(char *headers, struct http_request *request)
     if (has_transfer_encoding) {
         return 501;
     }
-    if (has_expectation) {
+    if (unsupported_expectation) {
         return 417;
     }
     if (strcmp(request->method, "GET") != 0 && strcmp(request->method, "POST") != 0) {
@@ -222,15 +268,30 @@ int http_parse_headers(char *headers, struct http_request *request)
     return 200;
 }
 
-int http_write_response(char *response, size_t capacity, const char *version,
-                        int status, const char *body)
+static int write_response(char *response, size_t capacity, const char *version,
+                          int status, const char *body, uintmax_t body_length,
+                          const char *content_type, const char *extra_headers)
 {
+    const char *protocol = version == NULL ? "HTTP/1.1" : version;
+    if (status == 100) {
+        return snprintf(response, capacity, "HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    if (status == 304) {
+        return snprintf(response, capacity, "%s 304 Not Modified\r\n%sConnection: close\r\n\r\n",
+                        protocol, extra_headers);
+    }
+
     const char *reason;
     const char *allow = "";
 
     switch (status) {
     case 200: reason = "OK"; break;
+    case 301: reason = "Moved Permanently"; break;
+    case 302: reason = "Found"; break;
+    case 303: reason = "See Other"; break;
     case 400: reason = "Bad Request"; break;
+    case 403: reason = "Forbidden"; break;
+    case 404: reason = "Not Found"; break;
     case 405: reason = "Method Not Allowed"; allow = "Allow: GET, POST\r\n"; break;
     case 413: reason = "Content Too Large"; break;
     case 417: reason = "Expectation Failed"; break;
@@ -240,10 +301,25 @@ int http_write_response(char *response, size_t capacity, const char *version,
     default: status = 500; reason = "Internal Server Error"; break;
     }
 
-    size_t body_length = strlen(body);
-    const char *content_type = body_length > 0 ? "Content-Type: text/plain\r\n" : "";
     return snprintf(response, capacity,
-                    "%s %d %s\r\n%sContent-Length: %zu\r\nConnection: close\r\n%s\r\n%s",
-                    version == NULL ? "HTTP/1.1" : version, status, reason,
-                    content_type, body_length, allow, body);
+                    "%s %d %s\r\n%s%s%sContent-Length: %" PRIuMAX
+                    "\r\nConnection: close\r\n%s%s\r\n%s",
+                    protocol, status, reason,
+                    content_type ? "Content-Type: " : "", content_type ? content_type : "",
+                    content_type ? "\r\n" : "", body_length,
+                    extra_headers, allow, body);
+}
+
+int http_write_response(char *response, size_t capacity, const char *version,
+                        int status, const char *body, const char *extra_headers)
+{
+    return write_response(response, capacity, version, status, body, strlen(body),
+                          *body ? "text/plain" : NULL, extra_headers);
+}
+
+int http_write_file_headers(char *response, size_t capacity, const char *version,
+                            const char *content_type, uintmax_t file_size)
+{
+    return write_response(response, capacity, version, 200, "", file_size,
+                          content_type, "");
 }
