@@ -1,4 +1,5 @@
 #include "tcp.h"
+#include "dispatch.h"
 
 #include "dynamic/add.h"
 #include "http/request.h"
@@ -41,7 +42,7 @@ int tcp_send_all(int socket_fd, const void *data, size_t length,
   return 0;
 }
 
-static int handle_client(int client_fd, int root_fd,
+int tcp_handle_client(int client_fd, int root_fd,
                          const volatile sig_atomic_t *stopping) {
   struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
   if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
@@ -118,6 +119,7 @@ int tcp_http_server(unsigned short port, const char *root,
   }
 
   int result = -1;
+  int dispatcher_started = 0;
   int reuse = 1;
   if (setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                  sizeof(reuse)) == -1) {
@@ -148,6 +150,12 @@ int tcp_http_server(unsigned short port, const char *root,
     perror("fcntl listener");
     goto cleanup;
   }
+
+  if (dispatch_start(root_fd, stopping) == -1) {
+    perror("dispatch_start");
+    goto cleanup;
+  }
+  dispatcher_started = 1;
 
   printf("HTTP server listening on 0.0.0.0:%u\n", (unsigned int)port);
   fflush(stdout);
@@ -182,15 +190,18 @@ int tcp_http_server(unsigned short port, const char *root,
     flags = fcntl(client, F_GETFL);
     if (flags == -1 || fcntl(client, F_SETFL, flags & ~O_NONBLOCK) == -1) {
       perror("fcntl client");
-    } else if (handle_client(client, root_fd, stopping) == -1 && !*stopping) {
-      perror("client I/O");
+      close(client);
+    } else {
+      dispatch_client(client);
     }
-    close(client);
   }
   result = 0;
 
 cleanup:
   close(listener_fd);
+  if (dispatcher_started) {
+    dispatch_stop();
+  }
   close(root_fd);
   return result;
 }

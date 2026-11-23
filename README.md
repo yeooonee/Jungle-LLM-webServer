@@ -2,7 +2,7 @@
 
 외부 HTTP/이벤트 루프 라이브러리 없이 **C11**과 **POSIX 소켓 API**만으로 구현하는 웹 서버 및 프록시 프로젝트입니다.
 
-> 현재 HTTP 요청 파싱·응답 송신, GET 정적 파일 서빙, POST 덧셈을 제공하는 순차 HTTP 서버입니다. 프록시·동시 요청 처리는 이후 구현 범위입니다.
+> 현재 HTTP 요청 파싱·응답 송신, GET 정적 파일 서빙, POST 덧셈을 제공합니다. 빌드에서 순차 처리 또는 스레드 풀을 선택하며, 기본값은 스레드 풀입니다. 프록시는 이후 구현 범위입니다.
 
 ## 프로젝트 구조
 
@@ -36,17 +36,17 @@
 ## 빌드 및 실행
 
 ```sh
-# 기본 디버그 빌드 (build/webserver)
+# 기본 디버그 빌드 (build/threadpool/webserver)
 make
 
-# 릴리스 빌드 (build/webserver-release)
+# 릴리스 빌드 (build/threadpool/webserver-release)
 make release
 
-# AddressSanitizer + UndefinedBehaviorSanitizer 빌드 (build/webserver-asan)
+# AddressSanitizer + UndefinedBehaviorSanitizer 빌드 (build/threadpool/webserver-asan)
 make asan
 
 # 실행
-./build/webserver 8080 ./www
+./build/threadpool/webserver 8080 ./www
 
 # 다른 터미널에서 정적 파일 응답 확인
 curl -i http://127.0.0.1:8080/
@@ -62,7 +62,7 @@ make test-integration
 
 # sanitizer 빌드로 통합 테스트
 make asan
-python3 tests/integration/test_static.py build/webserver-asan
+python3 tests/integration/test_static.py build/threadpool/webserver-asan
 
 # 빌드 산출물 정리
 make clean
@@ -70,9 +70,37 @@ make clean
 
 실행 인자는 `[포트] [정적 루트]`이며 생략하면 `8080`, `www`를 사용합니다. `0.0.0.0`에 바인딩하므로 다른 컴퓨터에서는 서버의 실제 IP로 접속합니다. 서버는 Ctrl+C 또는 SIGTERM으로 종료합니다.
 
-연결당 요청 하나에 응답하고 소켓을 닫으며, 연결 소켓은 블로킹 송수신을 사용합니다. 250ms 대기 제한으로 종료 요청을 주기적으로 확인하며, 대기 시간 만료만으로 연결을 끊지는 않습니다. 유휴 연결 하나가 다음 연결 처리를 막는 순차 서버입니다. 종료 요청 시 현재 연결도 닫습니다.
+연결당 요청 하나에 응답하고 소켓을 닫으며, 연결 소켓은 블로킹 송수신을 사용합니다. 250ms 대기 제한으로 종료 요청을 주기적으로 확인하며, 대기 시간 만료만으로 연결을 끊지는 않습니다. 순차 모드에서는 유휴 연결 하나가 다음 연결 처리를 막고, 스레드 풀에서는 작업자 하나를 점유합니다. 종료 요청 시 대기 연결을 닫고 처리 중인 연결을 중단합니다.
 
 학습 내용과 코드의 대응은 [TCP 소켓 서버 학습 문서](docs/learning/tcp/01-tcp-socket-server.md), 현재 학습 상태는 [진행 기록](docs/learning/tcp/progress.md)에 정리했습니다.
+
+## 빌드 시 동시성 선택
+
+```sh
+# 기본: 작업자 4개, 대기 큐 8개
+make CONCURRENCY=threadpool
+./build/threadpool/webserver 8080 ./www
+
+# 기존 순차 처리와 비교
+make CONCURRENCY=sequential
+./build/sequential/webserver 8080 ./www
+
+# 컴파일 모드와 독립적으로 조합 가능
+make CONCURRENCY=threadpool BUILD_MODE=asan
+make CONCURRENCY=sequential BUILD_MODE=release
+
+# 각 방식의 HTTP 기능 및 동시성 검증
+make CONCURRENCY=threadpool test-integration
+make CONCURRENCY=sequential test-integration
+```
+
+`CONCURRENCY`는 `sequential`, `threadpool`만 지원하며 다른 값은 빌드 오류입니다. fork·이벤트 루프는 아직 구현하지 않았습니다. 방식별 소스 하나만 링크하며 바이너리와 오브젝트는 `build/<방식>/`에 분리하므로 clean 없이 전환할 수 있습니다.
+
+두 방식 모두 같은 `tcp_handle_client()`로 요청을 처리합니다. 순차 모드는 수락 스레드가 직접 처리하고, 스레드 풀 모드는 큐에 연결 fd를 넣어 작업자에게 소유권을 넘깁니다. 큐는 뮤텍스·조건 변수로 보호하며 실제 HTTP 처리 중에는 큐 잠금을 잡지 않습니다.
+
+스레드 풀의 큐가 가득 차면 새로 수락한 연결을 즉시 닫습니다. HTTP 503을 보내는 정책은 아니므로 클라이언트는 연결 종료·리셋 등으로 관찰할 수 있습니다. 작업 중 4개와 큐 대기 8개 외에 OS의 수락 대기열은 별도로 존재합니다.
+
+종료 시 새 연결 수락을 멈추고 큐의 연결을 닫습니다. 처리 중인 소켓은 `shutdown()`으로 수신·송신 대기를 깨우고, 작업자가 자신의 fd를 닫고 끝날 때까지 join한 다음 큐와 루트 fd를 정리합니다. 응답을 모두 완료시키는 graceful shutdown은 아닙니다. 작업자는 SIGINT·SIGTERM을 차단하여 수락 스레드만 종료 시그널을 처리합니다.
 
 ## HTTP 요청 파서
 
@@ -120,7 +148,7 @@ int result = http_response_send(client_fd, &response, &stopping);
 
 ## 정적 파일 서빙
 
-`./build/webserver 8080 ./www`로 지정한 루트에서 파일을 제공합니다. 서버는 시작할 때 루트 디렉터리를 열고, 요청마다 해당 fd를 기준으로 파일을 찾습니다. 루트를 열 수 없으면 시작에 실패합니다.
+`./build/threadpool/webserver 8080 ./www`로 지정한 루트에서 파일을 제공합니다. 서버는 시작할 때 루트 디렉터리를 열고, 요청마다 해당 fd를 기준으로 파일을 찾습니다. 루트를 열 수 없으면 시작에 실패합니다.
 
 - 정적 파일은 GET으로 제공합니다. POST /add는 아래 동적 처리로 분기하며, 나머지 미지원 메서드·POST 경로는 501을 반환합니다.
 - `/`와 디렉터리 경로는 해당 디렉터리의 `index.html`을 제공합니다. 목록 출력과 리다이렉트는 하지 않습니다.
@@ -131,7 +159,7 @@ int result = http_response_send(client_fd, &response, &stopping);
 - 파일 크기로 Content-Length를 정하고 16 KiB씩 읽어 송신합니다. 파일 전체 크기에 비례한 메모리를 할당하지 않습니다.
 - 헤더 송신 이후 읽기 실패나 파일 축소가 발생하면 두 번째 오류 응답을 보내지 않고 연결을 종료합니다. 파일 증가는 처음 확인한 길이까지만 전송합니다. 전송 중 파일 변경의 일관성을 보장하지 않습니다.
 
-요청 수신에는 파서 한도인 헤더 8 KiB·본문 1 MiB를 적용합니다. 잘못된 요청과 불완전한 EOF는 400, 크기 초과는 413, 지원하지 않는 Transfer-Encoding은 501로 응답합니다. 전체 요청 수신 기한과 동시 처리는 아직 없으므로 느린 클라이언트가 다른 연결을 기다리게 할 수 있습니다.
+요청 수신에는 파서 한도인 헤더 8 KiB·본문 1 MiB를 적용합니다. 잘못된 요청과 불완전한 EOF는 400, 크기 초과는 413, 지원하지 않는 Transfer-Encoding은 501로 응답합니다. 전체 요청 수신 기한은 아직 없으므로 느린 클라이언트가 순차 모드를 막거나 스레드 풀 작업자를 계속 점유할 수 있습니다.
 
 
 ## 동적 요청: POST /add
@@ -146,5 +174,5 @@ curl -i http://127.0.0.1:8080/add --data-raw 'a=2&b=3'
 - 본문은 `a=<정수>&b=<정수>` 순서만 허용합니다. 음수와 선행 0은 가능하며 숫자는 C의 long 범위여야 합니다.
 - 공백, `+` 부호, URL 인코딩, 필드 순서 변경, 추가·중복 필드는 지원하지 않습니다. 일반적인 폼 파서가 아닙니다.
 - 본문 형식 오류, 숫자 범위 초과, 합계 오버플로는 400과 JSON 오류 본문으로 응답합니다. HTTP 파싱 자체의 오류는 기존 공통 오류 처리로 갑니다.
-- 전역 계산 상태는 없으며 각 요청의 숫자·합계·응답 버퍼는 해당 호출에서만 유지합니다. CGI·스레드 풀은 아직 연결하지 않았습니다.
+- 전역 계산 상태는 없으며 각 요청의 숫자·합계·응답 버퍼는 해당 호출에서만 유지합니다. CGI는 아직 연결하지 않았으며, 동시 처리 방식은 빌드 옵션으로 선택합니다.
 

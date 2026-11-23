@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 
-binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else "build/webserver").resolve())
+binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else "build/threadpool/webserver").resolve())
 
 
 def free_port():

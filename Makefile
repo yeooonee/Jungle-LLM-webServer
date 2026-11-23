@@ -4,7 +4,18 @@ UNAME_S  := $(shell uname -s)
 BUILD_DIR := build
 SRC_DIR   := src
 
-SRCS := $(sort $(wildcard $(SRC_DIR)/*.c $(SRC_DIR)/*/*.c $(SRC_DIR)/*/*/*.c))
+CONCURRENCY ?= threadpool
+ifeq ($(CONCURRENCY),sequential)
+  DISPATCH_SRC := $(SRC_DIR)/net/dispatch_sequential.c
+else ifeq ($(CONCURRENCY),threadpool)
+  DISPATCH_SRC := $(SRC_DIR)/net/dispatch_threadpool.c
+else
+  $(error Unsupported CONCURRENCY '$(CONCURRENCY)'; use sequential or threadpool)
+endif
+
+ALL_SRCS := $(sort $(wildcard $(SRC_DIR)/*.c $(SRC_DIR)/*/*.c $(SRC_DIR)/*/*/*.c))
+SRCS := $(filter-out $(SRC_DIR)/net/dispatch_%.c,$(ALL_SRCS)) $(DISPATCH_SRC)
+OUTPUT_DIR := $(BUILD_DIR)/$(CONCURRENCY)
 
 BASE_CPPFLAGS := -I$(SRC_DIR)
 ifeq ($(UNAME_S),Darwin)
@@ -21,18 +32,18 @@ BUILD_MODE ?= debug
 ifeq ($(BUILD_MODE),release)
   MODE_CFLAGS  := -O2 -DNDEBUG
   MODE_LDFLAGS :=
-  TARGET       := $(BUILD_DIR)/webserver-release
+  TARGET       := $(OUTPUT_DIR)/webserver-release
 else ifeq ($(BUILD_MODE),asan)
   MODE_CFLAGS  := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
   MODE_LDFLAGS := -fsanitize=address,undefined
-  TARGET       := $(BUILD_DIR)/webserver-asan
+  TARGET       := $(OUTPUT_DIR)/webserver-asan
 else
   MODE_CFLAGS  := -O0 -g
   MODE_LDFLAGS :=
-  TARGET       := $(BUILD_DIR)/webserver
+  TARGET       := $(OUTPUT_DIR)/webserver
 endif
 
-OBJ_DIR  := $(BUILD_DIR)/obj-$(BUILD_MODE)
+OBJ_DIR  := $(OUTPUT_DIR)/obj-$(BUILD_MODE)
 OBJS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 DEPS     := $(OBJS:.o=.d)
 
@@ -69,8 +80,8 @@ test:
 	else \
 		echo "Running unit tests..."; \
 		for t in $(UNIT_SRCS); do \
-			bin="$(BUILD_DIR)/tests/$$(basename $$t .c)"; \
-			mkdir -p "$(BUILD_DIR)/tests"; \
+			bin="$(OUTPUT_DIR)/tests-$(BUILD_MODE)/$$(basename $$t .c)"; \
+			mkdir -p "$(OUTPUT_DIR)/tests-$(BUILD_MODE)"; \
 			$(CC) $(CPPFLAGS) $(filter-out -DNDEBUG,$(CFLAGS)) "$$t" $(filter-out $(SRC_DIR)/main.c,$(SRCS)) -o "$$bin" $(LDFLAGS) && "$$bin" || exit 1; \
 		done; \
 	fi
@@ -80,12 +91,14 @@ clean:
 
 test-integration: $(TARGET)
 	python3 tests/integration/test_static.py $(TARGET)
+	python3 tests/integration/test_concurrency.py $(TARGET) $(CONCURRENCY)
 
 help:
+	@echo "CONCURRENCY=threadpool (default) or sequential"
 	@echo "Targets:"
-	@echo "  make          Build default debug binary ($(BUILD_DIR)/webserver)"
-	@echo "  make release  Build optimized binary ($(BUILD_DIR)/webserver-release)"
-	@echo "  make asan     Build with ASan + UBSan ($(BUILD_DIR)/webserver-asan)"
+	@echo "  make          Build default debug binary ($(OUTPUT_DIR)/webserver)"
+	@echo "  make release  Build optimized binary ($(OUTPUT_DIR)/webserver-release)"
+	@echo "  make asan     Build with ASan + UBSan ($(OUTPUT_DIR)/webserver-asan)"
 	@echo "  make test     Build and run unit tests in tests/unit/"
 	@echo "  make test-integration  Run static HTTP checks (Python 3 required)"
 	@echo "  make clean    Remove build artifacts"
