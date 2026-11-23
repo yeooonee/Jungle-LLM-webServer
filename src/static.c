@@ -57,7 +57,7 @@ int send_file_body(int out, int in) {
 }
 
 // 3-1단계: URL 디코딩 (%2e → '.'). 깨진 %XX나 %00이면 -1
-static int url_decode(const char *src, char *dst, size_t size) {
+int url_decode(const char *src, char *dst, size_t size) {
     size_t i = 0;
     for (; *src && *src != '?' && i < size - 1; src++) {   // '?' 뒤 쿼리는 파일 경로가 아님
         if (*src == '%') {
@@ -74,7 +74,7 @@ static int url_decode(const char *src, char *dst, size_t size) {
 }
 
 // errno(OS가 알려준 실패 이유) → 상태 코드
-static void send_fs_error(int fd) {
+void send_fs_error(int fd) {
     if (errno == ENOENT || errno == ENOTDIR) send_response(fd, 404, "Not Found", "Not Found");
     else if (errno == EACCES)                send_response(fd, 403, "Forbidden", "Forbidden");
     else                                     send_response(fd, 500, "Internal Server Error", "Internal Server Error");

@@ -1,5 +1,7 @@
 // 서버 뼈대: 실행 설정 → socket → bind → listen (1번) / accept → handle_client → close (반복)
+#include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +10,7 @@
 #include <sys/socket.h>
 
 #include "http.h"
+#include "cgi.h"
 #include "static.h"
 
 #define BACKLOG 10   // listen 대기열 길이
@@ -17,7 +20,22 @@ static struct {
     char port[16];
     char root[PATH_MAX];
     char mime_types[PATH_MAX];
-} conf = { "8080", "./www", "./mime.types" };
+    char cgi_root[PATH_MAX];
+    char cgi_timeout[16];
+    char cgi_max_output[16];
+    char cgi_log[PATH_MAX];
+} conf = { "8080", "./www", "./mime.types", "./build/cgi-bin", "5", "1048576", "./cgi.log" };
+
+// 숫자 설정값 검사. strtol: end = 숫자 다음 글자 위치. "80abc"면 end가 'a'를 가리킴 → 거절
+static long to_long(const char *s, long min, long max, const char *name) {
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < min || v > max) {
+        fprintf(stderr, "bad %s: %s\n", name, s);
+        exit(1);
+    }
+    return v;
+}
 
 // "키 값" 줄을 읽어 conf에 채우기. 모르는 키나 깨진 줄이면 어느 줄인지 알리고 종료
 static void load_config(const char *path) {
@@ -32,6 +50,10 @@ static void load_config(const char *path) {
         if (got == 2 && !strcmp(key, "port"))            snprintf(conf.port, sizeof(conf.port), "%s", value);
         else if (got == 2 && !strcmp(key, "root"))       snprintf(conf.root, sizeof(conf.root), "%s", value);
         else if (got == 2 && !strcmp(key, "mime_types")) snprintf(conf.mime_types, sizeof(conf.mime_types), "%s", value);
+        else if (got == 2 && !strcmp(key, "cgi_root"))   snprintf(conf.cgi_root, sizeof(conf.cgi_root), "%s", value);
+        else if (got == 2 && !strcmp(key, "cgi_timeout")) snprintf(conf.cgi_timeout, sizeof(conf.cgi_timeout), "%s", value);
+        else if (got == 2 && !strcmp(key, "cgi_max_output")) snprintf(conf.cgi_max_output, sizeof(conf.cgi_max_output), "%s", value);
+        else if (got == 2 && !strcmp(key, "cgi_log"))    snprintf(conf.cgi_log, sizeof(conf.cgi_log), "%s", value);
         else { fprintf(stderr, "%s:%d: bad line\n", path, no); exit(1); }
     }
     fclose(f);
@@ -76,19 +98,27 @@ int main(int argc, char **argv) {
     if (cli_port) snprintf(conf.port, sizeof(conf.port), "%s", cli_port);
     if (cli_root) snprintf(conf.root, sizeof(conf.root), "%s", cli_root);
 
-    // strtol: end = 숫자 다음 글자 위치. "80abc"면 end가 'a'를 가리킴 → 거절
-    char *end;
-    long port = strtol(conf.port, &end, 10);
-    if (end == conf.port || *end != '\0' || port <= 0 || port > 65535) {
-        fprintf(stderr, "bad port: %s\n", conf.port);
-        exit(1);
-    }
+    long port = to_long(conf.port, 1, 65535, "port");
+    long cgi_timeout = to_long(conf.cgi_timeout, 1, 3600, "cgi_timeout");
+    long cgi_max = to_long(conf.cgi_max_output, 1, 64L * 1024 * 1024, "cgi_max_output");
     // 루트는 서버 도는 동안 안 바뀜 → 시작할 때 1번 진짜 경로로 (없으면 포트 열기 전에 종료)
     static char root[PATH_MAX];
     if (!realpath(conf.root, root)) { perror(conf.root); exit(1); }
     if (load_mime_types(conf.mime_types) < 0) { perror(conf.mime_types); exit(1); }
 
+    // CGI: 프로그램 폴더 진짜 경로 + 로그 파일 (O_APPEND: 여러 번 써도 항상 끝에 덧붙임)
+    static char cgi_root[PATH_MAX];
+    if (!realpath(conf.cgi_root, cgi_root)) { perror(conf.cgi_root); exit(1); }
+    int log_fd = open(conf.cgi_log, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (log_fd < 0) { perror(conf.cgi_log); exit(1); }
+    cgi_init(cgi_root, (int)cgi_timeout, (size_t)cgi_max, log_fd);
+
+    // 끊긴 상대(손님 소켓, 먼저 끝난 CGI의 파이프)에 write하면 OS가 SIGPIPE를 보냄 → 기본 동작은 서버 종료
+    // 무시하면 write가 -1(EPIPE)을 돌려주고, write_all이 그걸 실패로 처리
+    signal(SIGPIPE, SIG_IGN);
+
     int server_fd = open_listen_socket((int)port);
+    fcntl(server_fd, F_SETFD, FD_CLOEXEC);   // exec된 CGI 프로그램에 메인 소켓이 따라가지 않게
     printf("listening on http://localhost:%ld (root: %s)\n", port, root);
 
     while (1) {

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "http.h"
+#include "cgi.h"
 #include "static.h"
 
 int write_all(int fd, const char *buf, size_t len) {
@@ -62,6 +63,8 @@ void handle_client(int client_fd, const char *root) {
     long content_length = 0;
     int has_te = 0;                                            // Transfer-Encoding 헤더가 있었는지
     int has_host = 0;                                          // Host 헤더가 있었는지
+    char content_type[256] = "";                               // CGI에 CONTENT_TYPE으로 넘김
+    char *body = NULL;
 
     // 파싱 ② 헤더: 첫 줄 다음부터 빈 줄(\r\n\r\n)까지 "이름: 값"
     if (ok) {
@@ -84,6 +87,8 @@ void handle_client(int client_fd, const char *root) {
                     has_te = 1;
                 if (colon - line == 4 && strncasecmp(line, "Host", 4) == 0)
                     has_host = 1;
+                if (colon - line == 12 && strncasecmp(line, "Content-Type", 12) == 0)
+                    snprintf(content_type, sizeof(content_type), "%.*s", (int)(end - value), value);
             }
             line = end + 2;                                    // 다음 줄로
         }
@@ -94,7 +99,7 @@ void handle_client(int client_fd, const char *root) {
     // 파싱 ③ 본문: 문자로 자르지 않고 Content-Length 바이트만큼 모일 때까지 read 반복
     int too_big = 0;
     if (ok && !has_te) {                                       // TE가 있으면 본문 길이를 모르니 읽지 않음
-        char *body = header_end + 4;                           // 빈 줄 바로 다음이 본문 시작
+        body = header_end + 4;                                 // 빈 줄 바로 다음이 본문 시작
         size_t room = sizeof(buf) - 1 - (body - buf);          // 본문이 들어갈 남은 공간
         size_t have = total - (body - buf);                    // 헤더와 같이 이미 도착한 본문
         if (content_length < 0) ok = 0;
@@ -124,8 +129,11 @@ void handle_client(int client_fd, const char *root) {
     // 어떤 경로에서도 구현 안 한 메서드 → 501 (RFC 9110)
     else if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0)
         send_response(client_fd, 501, "Not Implemented", "Not Implemented");
+    // /cgi-bin/ 으로 시작 → 동적 처리 (GET·POST 둘 다)
+    else if (strncmp(path, "/cgi-bin/", 9) == 0)
+        serve_cgi(client_fd, method, path, body, (size_t)content_length, content_type);
     else if (strcmp(method, "GET") == 0)
         serve_file(client_fd, root, path);
-    else   // POST: 정적 파일은 받을 곳이 없음 (동적 처리는 Day 4)
+    else   // POST: 정적 파일은 받을 곳이 없음
         send_response(client_fd, 405, "Method Not Allowed", "Method Not Allowed");
 }
