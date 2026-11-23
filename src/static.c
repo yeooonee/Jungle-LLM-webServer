@@ -51,12 +51,7 @@ int send_file_body(int out, int in) {
     char chunk[8192];
     ssize_t n;
     while ((n = read(in, chunk, sizeof(chunk))) > 0) {
-        // write는 요청한 것보다 적게 보낼 수 있음 → 남은 만큼 다시
-        for (ssize_t sent = 0; sent < n; ) {
-            ssize_t w = write(out, chunk + sent, n - sent);
-            if (w < 0) return -1;                               // 손님이 끊음
-            sent += w;
-        }
+        if (write_all(out, chunk, n) < 0) return -1;            // 손님이 끊음
     }
     return n < 0 ? -1 : 0;
 }
@@ -88,7 +83,8 @@ static void send_fs_error(int fd) {
 void serve_file(int fd, const char *root, const char *url_path) {
     // 3-1. 디코딩
     char decoded[1024];
-    if (url_decode(url_path, decoded, sizeof(decoded)) < 0 || decoded[0] != '/') {
+    // '\'는 브라우저가 '/'처럼 취급 → 301 Location이 다른 호스트로 해석될 수 있어 거절
+    if (url_decode(url_path, decoded, sizeof(decoded)) < 0 || decoded[0] != '/' || strchr(decoded, '\\')) {
         send_response(fd, 400, "Bad Request", "Bad Request");
         return;
     }

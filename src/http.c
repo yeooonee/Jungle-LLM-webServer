@@ -9,6 +9,15 @@
 #include "http.h"
 #include "static.h"
 
+int write_all(int fd, const char *buf, size_t len) {
+    for (size_t sent = 0; sent < len; ) {
+        ssize_t w = write(fd, buf + sent, len - sent);   // OS가 실제로 받아 간 바이트 수
+        if (w < 0) return -1;
+        sent += w;
+    }
+    return 0;
+}
+
 void send_head(int fd, int code, const char *reason, const char *type, size_t len) {
     char header[256];
     int n = snprintf(header, sizeof(header),
@@ -18,13 +27,13 @@ void send_head(int fd, int code, const char *reason, const char *type, size_t le
                      "Connection: close\r\n"
                      "\r\n",
                      code, reason, type, len);
-    write(fd, header, n);
+    write_all(fd, header, n);
 }
 
 // 문자열이라 strlen으로 길이를 재도 안전
 void send_response(int fd, int code, const char *reason, const char *body) {
     send_head(fd, code, reason, "text/plain", strlen(body));
-    write(fd, body, strlen(body));
+    write_all(fd, body, strlen(body));
 }
 
 void handle_client(int client_fd, const char *root) {
