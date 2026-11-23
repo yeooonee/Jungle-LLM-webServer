@@ -13,21 +13,52 @@
 #include "http.h"
 #include "static.h"
 
-// 6단계: 확장자 → MIME. 모르면 "그냥 바이트"
+// 6단계: 확장자 → MIME 표. 서버 시작 때 mime.types 파일에서 1번 채움
+// shortcut: 고정 배열 256칸, 넘는 줄은 무시 → 확장자가 더 많아지면 malloc으로
+static struct { char ext[16]; char type[128]; } mimes[256];
+static int mime_count = 0;
+
+// 형식(Apache /etc/mime.types와 같음): "타입 확장자 확장자 ..." 한 줄씩, '#'은 주석
+int load_mime_types(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *type = strtok(line, " \t\r\n");
+        if (!type) continue;                                    // 빈 줄
+        for (char *ext; (ext = strtok(NULL, " \t\r\n")) && mime_count < 256; mime_count++) {
+            snprintf(mimes[mime_count].ext, sizeof(mimes[0].ext), "%s", ext);
+            snprintf(mimes[mime_count].type, sizeof(mimes[0].type), "%s", type);
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+// 확장자로 표 찾기. 모르면 "그냥 바이트"
 static const char *mime_type(const char *path) {
     const char *dot = strrchr(path, '.');
-    if (!dot) return "application/octet-stream";
-    if (!strcasecmp(dot, ".html")) return "text/html; charset=utf-8";
-    if (!strcasecmp(dot, ".css"))  return "text/css";
-    if (!strcasecmp(dot, ".js"))   return "text/javascript";
-    if (!strcasecmp(dot, ".json")) return "application/json";
-    if (!strcasecmp(dot, ".txt"))  return "text/plain; charset=utf-8";
-    if (!strcasecmp(dot, ".png"))  return "image/png";
-    if (!strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg")) return "image/jpeg";
-    if (!strcasecmp(dot, ".gif"))  return "image/gif";
-    if (!strcasecmp(dot, ".svg"))  return "image/svg+xml";
-    if (!strcasecmp(dot, ".ico"))  return "image/x-icon";
+    if (dot)
+        for (int i = 0; i < mime_count; i++)
+            if (!strcasecmp(dot + 1, mimes[i].ext)) return mimes[i].type;
     return "application/octet-stream";
+}
+
+// 7단계: in에서 읽어 out으로 8KB씩 복사 (Day 4 프록시 중계에도 재사용). 실패하면 -1
+int send_file_body(int out, int in) {
+    char chunk[8192];
+    ssize_t n;
+    while ((n = read(in, chunk, sizeof(chunk))) > 0) {
+        // write는 요청한 것보다 적게 보낼 수 있음 → 남은 만큼 다시
+        for (ssize_t sent = 0; sent < n; ) {
+            ssize_t w = write(out, chunk + sent, n - sent);
+            if (w < 0) return -1;                               // 손님이 끊음
+            sent += w;
+        }
+    }
+    return n < 0 ? -1 : 0;
 }
 
 // 3-1단계: URL 디코딩 (%2e → '.'). 깨진 %XX나 %00이면 -1
@@ -92,9 +123,6 @@ void serve_file(int fd, const char *root, const char *url_path) {
 
     // 6~7. 헤더 → 파일 내용을 조각(8KB)씩 그대로 복사
     send_head(fd, 200, "OK", mime_type(real), (size_t)st.st_size);
-    char chunk[8192];
-    ssize_t n;
-    while ((n = read(file, chunk, sizeof(chunk))) > 0)
-        if (write(fd, chunk, n) < 0) break;                     // 손님이 끊음
+    send_file_body(fd, file);   // 헤더를 이미 보냈으니 실패해도 다른 응답은 못 보냄 → close만
     close(file);
 }

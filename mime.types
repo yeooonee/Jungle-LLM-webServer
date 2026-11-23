@@ -1,0 +1,13 @@
+# 확장자 → Content-Type 표. 형식: 타입 확장자 확장자 ...
+# 수정 후 서버만 다시 켜면 반영 (재빌드 불필요)
+# 타입 안에 공백을 쓰면 안 됨 → charset 파라미터는 ';' 뒤에 붙여 씀
+text/html;charset=utf-8     html htm
+text/css                    css
+text/javascript             js
+application/json            json
+text/plain;charset=utf-8    txt
+image/png                   png
+image/jpeg                  jpg jpeg
+image/gif                   gif
+image/svg+xml               svg
+image/x-icon                ico
