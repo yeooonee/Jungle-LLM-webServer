@@ -1,5 +1,6 @@
 #include "tcp.h"
 
+#include "dynamic/add.h"
 #include "http/request.h"
 #include "http/response.h"
 #include "static/file.h"
@@ -43,7 +44,8 @@ int tcp_send_all(int socket_fd, const void *data, size_t length,
 static int handle_client(int client_fd, int root_fd,
                          const volatile sig_atomic_t *stopping) {
   struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
-  if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
+  if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                 sizeof(timeout)) == -1) {
     return -1;
   }
   size_t capacity = HTTP_MAX_HEADER_BYTES + HTTP_MAX_BODY_BYTES;
@@ -57,18 +59,27 @@ static int handle_client(int client_fd, int root_fd,
   while (!*stopping) {
     ssize_t count = recv(client_fd, buffer + used, capacity - used, 0);
     if (count < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        continue;
       result = -1;
       break;
     }
-    if (count == 0 && used == 0) break;
+    if (count == 0 && used == 0)
+      break;
     used += (size_t)count;
     http_request request;
     http_parse_result parsed = http_request_parse(buffer, used, &request);
-    if (parsed == HTTP_PARSE_INCOMPLETE && count > 0 && used < capacity) continue;
+    if (parsed == HTTP_PARSE_INCOMPLETE && count > 0 && used < capacity)
+      continue;
     if (parsed == HTTP_PARSE_COMPLETE && request.method.length == 3 &&
         memcmp(request.method.data, "GET", 3) == 0) {
       result = static_file_send(client_fd, root_fd, request.target, stopping);
+    } else if (parsed == HTTP_PARSE_COMPLETE && request.method.length == 4 &&
+               memcmp(request.method.data, "POST", 4) == 0 &&
+               request.target.length == 4 &&
+               memcmp(request.target.data, "/add", 4) == 0) {
+      /* `POST /add`의 경우에만 동적 처리로 넘김 */
+      result = dynamic_add_send(client_fd, request.body, stopping);
     } else {
       int status = 400;
       const char *body = "Bad Request\n";
@@ -76,11 +87,13 @@ static int handle_client(int client_fd, int root_fd,
           (parsed == HTTP_PARSE_INCOMPLETE && used == capacity)) {
         status = 413;
         body = "Content Too Large\n";
-      } else if (parsed == HTTP_PARSE_UNSUPPORTED || parsed == HTTP_PARSE_COMPLETE) {
+      } else if (parsed == HTTP_PARSE_UNSUPPORTED ||
+                 parsed == HTTP_PARSE_COMPLETE) {
         status = 501;
         body = "Not Implemented\n";
       }
-      http_response response = {status, "text/plain; charset=utf-8", body, strlen(body)};
+      http_response response = {status, "text/plain; charset=utf-8", body,
+                                strlen(body)};
       result = http_response_send(client_fd, &response, stopping);
     }
     break;

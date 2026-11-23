@@ -1,6 +1,7 @@
 """실제 HTTP 클라이언트로 정적 파일과 경로 접근 제한을 확인한다."""
 import contextlib
 import http.client
+import json
 import os
 from pathlib import Path
 import signal
@@ -51,10 +52,10 @@ def check_response(response, expected, body=None, mime=None):
         assert response.getheader("Content-Type") == mime
 
 
-def request(port, path, expected=200, body=None, mime=None, method="GET"):
+def request(port, path, expected=200, body=None, mime=None, method="GET", request_body=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
-        connection.request(method, path)
+        connection.request(method, path, body=request_body)
         check_response(connection.getresponse(), expected, body, mime)
     finally:
         connection.close()
@@ -123,6 +124,22 @@ with tempfile.TemporaryDirectory() as temp:
         if os.geteuid() != 0:
             request(port, "/blocked.txt", 403)
         request(port, "/", 501, method="POST")
+        for payload, answer in [(b"a=2&b=3", 5), (b"a=-12&b=3", -9),
+                                (b"a=0&b=0", 0)]:
+            expected_body = json.dumps({"result": answer}, separators=(",", ":")).encode()
+            request(port, "/add", body=expected_body, mime="application/json",
+                    method="POST", request_body=payload)
+        for payload in [b"", b"a=2&b=", b"a=2x&b=3", b"b=3&a=2",
+                        b"a=2&b=3&c=4", b"a=2&b=3\x00extra",
+                        b"a=9223372036854775807&b=1",
+                        b"a=-9223372036854775808&b=-1",
+                        b"a=9999999999999999999999999&b=0"]:
+            request(port, "/add", 400, mime="application/json",
+                    method="POST", request_body=payload)
+        request(port, "/add-more", 501, method="POST", request_body=b"a=2&b=3")
+        raw_request(port, [bytes([byte]) for byte in
+                          b"POST /add HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\na=2&b=3"], 200)
+        raw_request(port, [b"POST /add HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\na=2"], 400)
         raw_request(port, [bytes([byte]) for byte in b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"], 200)
         raw_request(port, [b"GET / HTTP/1.1\r\n\r\n"], 400)
         raw_request(port, [b"GET / HTTP/1.1\r\nHost: x\r\n"], 400)
