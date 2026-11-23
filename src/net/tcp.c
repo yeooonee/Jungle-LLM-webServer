@@ -1,11 +1,16 @@
 #include "tcp.h"
 
+#include "http/request.h"
+#include "http/response.h"
+#include "static/file.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
-#include <sys/_endian.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -35,41 +40,67 @@ int tcp_send_all(int socket_fd, const void *data, size_t length,
   return 0;
 }
 
-static int echo_client(int client, const volatile sig_atomic_t *stopping) {
-  /* I/O 직전에 종료 시그널이 도착해도 무한히 기다리지 않도록 대기 시간을 제한.
-   */
+static int handle_client(int client_fd, int root_fd,
+                         const volatile sig_atomic_t *stopping) {
   struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
-  if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
-          -1 ||
-      setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) ==
-          -1) {
+  if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
     return -1;
   }
-  char buffer[4096];
-  while (!*stopping) {
-    ssize_t received = recv(client, buffer, sizeof(buffer), 0);
-    if (received == 0) {
-      return 0;
-    }
-    if (received < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-        continue;
-      }
-      return -1;
-    }
-    if (tcp_send_all(client, buffer, (size_t)received, stopping) == -1) {
-      return -1;
-    }
+  size_t capacity = HTTP_MAX_HEADER_BYTES + HTTP_MAX_BODY_BYTES;
+  char *buffer = malloc(capacity);
+  if (buffer == NULL) {
+    http_response response = {500, "text/plain", "Internal Server Error\n", 22};
+    return http_response_send(client_fd, &response, stopping);
   }
-  return 0;
+  size_t used = 0;
+  int result = 0;
+  while (!*stopping) {
+    ssize_t count = recv(client_fd, buffer + used, capacity - used, 0);
+    if (count < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      result = -1;
+      break;
+    }
+    if (count == 0 && used == 0) break;
+    used += (size_t)count;
+    http_request request;
+    http_parse_result parsed = http_request_parse(buffer, used, &request);
+    if (parsed == HTTP_PARSE_INCOMPLETE && count > 0 && used < capacity) continue;
+    if (parsed == HTTP_PARSE_COMPLETE && request.method.length == 3 &&
+        memcmp(request.method.data, "GET", 3) == 0) {
+      result = static_file_send(client_fd, root_fd, request.target, stopping);
+    } else {
+      int status = 400;
+      const char *body = "Bad Request\n";
+      if (parsed == HTTP_PARSE_TOO_LARGE ||
+          (parsed == HTTP_PARSE_INCOMPLETE && used == capacity)) {
+        status = 413;
+        body = "Content Too Large\n";
+      } else if (parsed == HTTP_PARSE_UNSUPPORTED || parsed == HTTP_PARSE_COMPLETE) {
+        status = 501;
+        body = "Not Implemented\n";
+      }
+      http_response response = {status, "text/plain; charset=utf-8", body, strlen(body)};
+      result = http_response_send(client_fd, &response, stopping);
+    }
+    break;
+  }
+  free(buffer);
+  return result;
 }
 
-int tcp_echo_server(unsigned short port,
+int tcp_http_server(unsigned short port, const char *root,
                     const volatile sig_atomic_t *stopping) {
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY);
+  if (root_fd == -1) {
+    perror("static root");
+    return -1;
+  }
   int listener_fd = socket(AF_INET, SOCK_STREAM,
                            0); /* IPv4, 연결 기반 바이트 스트림 소켓, TCP 사용*/
   if (listener_fd == -1) {
     perror("socket");
+    close(root_fd);
     return -1;
   }
 
@@ -105,7 +136,7 @@ int tcp_echo_server(unsigned short port,
     goto cleanup;
   }
 
-  printf("TCP echo server listening on 0.0.0.0:%u\n", (unsigned int)port);
+  printf("HTTP server listening on 0.0.0.0:%u\n", (unsigned int)port);
   fflush(stdout);
 
   while (!*stopping) {
@@ -138,7 +169,7 @@ int tcp_echo_server(unsigned short port,
     flags = fcntl(client, F_GETFL);
     if (flags == -1 || fcntl(client, F_SETFL, flags & ~O_NONBLOCK) == -1) {
       perror("fcntl client");
-    } else if (echo_client(client, stopping) == -1 && !*stopping) {
+    } else if (handle_client(client, root_fd, stopping) == -1 && !*stopping) {
       perror("client I/O");
     }
     close(client);
@@ -147,5 +178,6 @@ int tcp_echo_server(unsigned short port,
 
 cleanup:
   close(listener_fd);
+  close(root_fd);
   return result;
 }

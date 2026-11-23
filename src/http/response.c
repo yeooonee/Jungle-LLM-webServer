@@ -17,6 +17,10 @@ static const char *reason_phrase(int status) {
     return "Forbidden";
   case 404:
     return "Not Found";
+  case 413:
+    return "Content Too Large";
+  case 501:
+    return "Not Implemented";
   case 500:
     return "Internal Server Error";
   default:
@@ -37,10 +41,9 @@ static int valid_content_type(const char *value) {
   return 1;
 }
 
-int http_response_send(int client_fd, const http_response *response,
+int http_response_send_headers(int client_fd, const http_response *response,
                        const volatile sig_atomic_t *stopping) {
   if (response == NULL || stopping == NULL ||
-      (response->body == NULL && response->body_length != 0) ||
       !valid_content_type(response->content_type)) {
     errno = EINVAL;
     return -1;
@@ -78,7 +81,16 @@ int http_response_send(int client_fd, const http_response *response,
   if (setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == -1) {
     return -1;
   }
-  if (tcp_send_all(client_fd, headers, (size_t)length, stopping) == -1) {
+  return tcp_send_all(client_fd, headers, (size_t)length, stopping);
+}
+
+int http_response_send(int client_fd, const http_response *response,
+                       const volatile sig_atomic_t *stopping) {
+  if (response == NULL || (response->body == NULL && response->body_length != 0)) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (http_response_send_headers(client_fd, response, stopping) == -1) {
     return -1;
   }
   return tcp_send_all(client_fd, response->body, response->body_length, stopping);

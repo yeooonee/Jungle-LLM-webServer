@@ -14,11 +14,11 @@ static void request_stop(int signal_number) {
 
 int main(int argc, char *argv[]) {
   long port = 8080;
-  if (argc > 2) {
-    fprintf(stderr, "Usage: %s [port: 1-65535]\n", argv[0]);
+  if (argc > 3) {
+    fprintf(stderr, "Usage: %s [port: 1-65535] [static-root]\n", argv[0]);
     return EXIT_FAILURE;
   }
-  if (argc == 2) {
+  if (argc >= 2) {
     char *end;
     errno = 0;
     port = strtol(argv[1], &end, 10);
@@ -47,6 +47,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  return tcp_echo_server((unsigned short)port, &stopping) == 0 ? EXIT_SUCCESS
-                                                               : EXIT_FAILURE;
+  const char *root = argc == 3 ? argv[2] : "www";
+  return tcp_http_server((unsigned short)port, root, &stopping) == 0
+             ? EXIT_SUCCESS : EXIT_FAILURE;
 }
