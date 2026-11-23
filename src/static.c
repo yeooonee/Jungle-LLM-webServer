@@ -80,6 +80,27 @@ static void send_fs_error(int fd) {
     else                                     send_response(fd, 500, "Internal Server Error", "Internal Server Error");
 }
 
+// 폴더인데 URL 끝에 '/'가 없을 때: 301로 '/' 붙인 주소 알려 주기 (Nginx·Apache 기본 동작)
+// Location엔 인코딩된 원본(url_path)을 써야 %20 등이 안 깨짐. 쿼리는 '/' 뒤로 유지
+static void send_redirect(int fd, const char *url_path) {
+    // 경로 부분의 연속 '/'를 하나로 (//css/ 는 브라우저가 "css라는 호스트"로 해석 → 오픈 리다이렉트)
+    char loc[1100];   // url_path는 http.c에서 1023자 제한
+    size_t j = 0;
+    for (const char *p = url_path; *p && *p != '?' && j < sizeof(loc) - 2; p++)
+        if (!(*p == '/' && j > 0 && loc[j - 1] == '/')) loc[j++] = *p;
+    loc[j++] = '/';
+    loc[j] = '\0';
+    char head[2300];
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.1 301 Moved Permanently\r\n"
+                     "Location: %s%s\r\n"
+                     "Content-Length: 0\r\n"
+                     "Connection: close\r\n"
+                     "\r\n",
+                     loc, url_path + strcspn(url_path, "?"));
+    write_all(fd, head, n);
+}
+
 void serve_file(int fd, const char *root, const char *url_path) {
     // 3-1. 디코딩
     char decoded[1024];
@@ -111,25 +132,8 @@ void serve_file(int fd, const char *root, const char *url_path) {
     // 5. 크기 (Content-Length용). 디렉터리는 파일이 아니니 403
     struct stat st;
     if (fstat(file, &st) < 0) { send_fs_error(fd); close(file); return; }
-    // 폴더인데 URL 끝에 '/'가 없음 → 301로 '/' 붙인 주소 알려 주기 (Nginx·Apache 기본 동작)
-    // Location엔 인코딩된 원본(url_path)을 써야 %20 등이 안 깨짐. 쿼리는 '/' 뒤로 유지
     if (S_ISDIR(st.st_mode) && decoded[strlen(decoded) - 1] != '/') {
-        // 경로 부분의 연속 '/'를 하나로 (//css/ 는 브라우저가 "css라는 호스트"로 해석 → 오픈 리다이렉트)
-        char loc[1100];   // url_path는 http.c에서 1023자 제한
-        size_t j = 0;
-        for (const char *p = url_path; *p && *p != '?' && j < sizeof(loc) - 2; p++)
-            if (!(*p == '/' && j > 0 && loc[j - 1] == '/')) loc[j++] = *p;
-        loc[j++] = '/';
-        loc[j] = '\0';
-        char head[2300];
-        int n = snprintf(head, sizeof(head),
-                         "HTTP/1.1 301 Moved Permanently\r\n"
-                         "Location: %s%s\r\n"
-                         "Content-Length: 0\r\n"
-                         "Connection: close\r\n"
-                         "\r\n",
-                         loc, url_path + strcspn(url_path, "?"));
-        write_all(fd, head, n);
+        send_redirect(fd, url_path);   // 폴더인데 끝에 '/' 없음 → 301
         close(file);
         return;
     }
