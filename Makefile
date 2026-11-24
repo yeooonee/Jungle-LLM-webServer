@@ -21,7 +21,10 @@ build/server_copy: experiments/server_copy.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $<
 
+test: all
+	python3 tests/test_concurrency.py
+
 clean:
 	rm -rf build
 
-.PHONY: all clean
+.PHONY: all clean test

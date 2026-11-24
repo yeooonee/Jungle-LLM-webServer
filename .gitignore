@@ -1,3 +1,5 @@
 CLAUDE.md
 build/
 cgi.log
+tests/fixtures/www/big.bin
+__pycache__/
