@@ -1,7 +1,5 @@
-#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
-#define _DARWIN_C_SOURCE // Expose O_NOFOLLOW in the macOS SDK.
-#endif
-
+#include "cgi.h"
+#include "file_pool.h"
 #include "http.h"
 
 #include <arpa/inet.h>
@@ -13,18 +11,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/event.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-enum { MAX_CLIENTS = 64, BUFFER_SIZE = 4096 };
+enum {
+    MAX_CLIENTS = 64,
+    MAX_EVENTS = MAX_CLIENTS * 2 + 5,
+    BUFFER_SIZE = 4096,
+    KEEP_ALIVE_TIMEOUT_MS = 5000
+};
 #define HELLO_ETAG "\"hello-v1\""
 #define STATIC_PREFIX "/static/"
+#define CGI_PREFIX "/cgi-bin/"
 
 struct http_connection {
     int fd;
+    int slot;
+    uint64_t connection_id;
+    short filter;
+    char input[BUFFER_SIZE];
+    size_t input_length;
+    bool keep_alive_timer;
     char headers[HTTP_MAX_HEADERS + 1];
     size_t header_length;
     bool headers_complete;
@@ -34,26 +43,33 @@ struct http_connection {
     size_t response_length;
     size_t response_sent;
     bool interim_response;
-    int file_fd;
-    off_t file_remaining;
-    char file_buffer[BUFFER_SIZE];
-    size_t file_length;
+    bool keep_alive;
+    bool file_pending;
+    struct file_job *file;
     size_t file_sent;
+    struct cgi_process *cgi;
 };
 
-static int set_nonblocking(int fd)
+static void handle_stop_signal(int signal_number)
+{
+    (void)signal_number;
+    // The event loop receives the same signal through EVFILT_SIGNAL.
+}
+
+static int configure_socket(int fd)
 {
     int flags = fcntl(fd, F_GETFL);
-    if (flags == -1) {
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         return -1;
     }
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return fcntl(fd, F_SETFD, FD_CLOEXEC);
 }
 
 // Return 0 while more bytes are needed, or an HTTP status when ready to reply.
 static int read_request_bytes(struct http_connection *state, const char *data,
-                              size_t length)
+                              size_t length, size_t *consumed)
 {
+    const char *start = data;
     while (!state->headers_complete && length > 0) {
         char byte = *data++;
         length--;
@@ -84,6 +100,7 @@ static int read_request_bytes(struct http_connection *state, const char *data,
         }
     }
 
+    *consumed = (size_t)(data - start);
     if (!state->headers_complete) {
         return 0;
     }
@@ -95,6 +112,7 @@ static int read_request_bytes(struct http_connection *state, const char *data,
         memcpy(state->request.body + state->body_received, data, length);
         state->body_received += length;
     }
+    *consumed += length;
 
     if (state->body_received == state->request.content_length) {
         return 200;
@@ -125,164 +143,35 @@ static bool request_path_is(const char *path, const char *expected)
     return strlen(expected) == length && memcmp(path, expected, length) == 0;
 }
 
-static int hex_digit(unsigned char byte)
+static bool prepare_response(struct http_connection *state, int length, int status)
 {
-    if (byte >= '0' && byte <= '9') {
-        return byte - '0';
+    if (length < 0 || (size_t)length >= sizeof(state->response)) {
+        return false;
     }
-    if (byte >= 'A' && byte <= 'F') {
-        return byte - 'A' + 10;
-    }
-    if (byte >= 'a' && byte <= 'f') {
-        return byte - 'a' + 10;
-    }
-    return -1;
+    state->response_length = (size_t)length;
+    state->response_sent = 0;
+    state->interim_response = status == 100;
+    return true;
 }
 
-static int decode_path_component(const char *path, size_t length,
-                                 char *name)
-{
-    size_t used = 0;
-    for (size_t i = 0; i < length; i++) {
-        unsigned char byte = (unsigned char)path[i];
-        if (byte == '%') {
-            if (length - i < 3) {
-                return 400;
-            }
-            int high = hex_digit((unsigned char)path[i + 1]);
-            int low = hex_digit((unsigned char)path[i + 2]);
-            if (high < 0 || low < 0) {
-                return 400;
-            }
-            byte = (unsigned char)(high * 16 + low);
-            i += 2;
-        }
-        if (byte == '/' || byte == '\\' || byte < 0x20 || byte == 0x7f) {
-            return 403;
-        }
-        name[used++] = (char)byte;
-    }
-    name[used] = '\0';
-
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-        return 403;
-    }
-    return used == 0 ? 404 : 200;
-}
-
-static int file_open_status(int directory, const char *name, int error)
-{
-    switch (error) {
-    case EACCES:
-    case EPERM:
-    case ELOOP:
-        return 403;
-    case ENOTDIR: {
-        struct stat info;
-        // O_DIRECTORY may report ENOTDIR for a symlink on some filesystems.
-        if (fstatat(directory, name, &info, AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISLNK(info.st_mode)) {
-            return 403;
-        }
-        return 404;
-    }
-    case ENOENT:
-    case ENAMETOOLONG:
-        return 404;
-    default:
-        return 500;
-    }
-}
-
-static const char *file_content_type(const char *name)
-{
-    static const struct {
-        const char *extension;
-        const char *content_type;
-    } types[] = {
-        {".html", "text/html"}, {".htm", "text/html"}, {".css", "text/css"},
-        {".js", "text/javascript"}, {".png", "image/png"}, {".jpg", "image/jpeg"},
-        {".jpeg", "image/jpeg"}, {".gif", "image/gif"}, {".svg", "image/svg+xml"},
-        {".webp", "image/webp"}, {".ico", "image/x-icon"}, {".txt", "text/plain"},
-        {".json", "application/json"}, {".pdf", "application/pdf"},
-    };
-    const char *extension = strrchr(name, '.');
-    if (extension != NULL) {
-        for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
-            if (strcasecmp(extension, types[i].extension) == 0) {
-                return types[i].content_type;
-            }
-        }
-    }
-    return "application/octet-stream";
-}
-
-static int open_static_file(struct http_connection *state, int root_fd,
-                            const char *path, const char **content_type)
-{
-    if (root_fd == -1) {
-        return 404;
-    }
-
-    int directory = root_fd;
-    // The request headers already bound the length of each path component.
-    char name[HTTP_MAX_HEADERS + 1];
-    int status;
-    for (;;) {
-        size_t length = strcspn(path, "/?");
-        status = decode_path_component(path, length, name);
-        if (status != 200) {
-            break;
-        }
-
-        bool last = path[length] != '/';
-        int flags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
-        if (!last) {
-            flags |= O_DIRECTORY;
-        }
-        int fd = openat(directory, name, flags);
-        if (fd == -1) {
-            status = file_open_status(directory, name, errno);
-            break;
-        }
-        if (last) {
-            struct stat info;
-            if (fstat(fd, &info) == -1 || info.st_size < 0) {
-                status = 500;
-            } else if (!S_ISREG(info.st_mode)) {
-                status = 403;
-            }
-            if (status == 200) {
-                state->file_fd = fd;
-                state->file_remaining = info.st_size;
-                *content_type = file_content_type(name);
-            } else {
-                close(fd);
-            }
-            break;
-        }
-        if (directory != root_fd) {
-            close(directory);
-        }
-        directory = fd;
-        path += length + 1;
-    }
-    if (directory != root_fd) {
-        close(directory);
-    }
-    return status;
-}
-
-static bool queue_response(struct http_connection *state, int root_fd, int status)
+static bool queue_response(struct http_connection *state, struct file_pool *pool, int status)
 {
     const char *body = "";
     const char *extra_headers = "";
-    const char *content_type = NULL;
     if (status == 200 && strcmp(state->request.method, "GET") == 0) {
         const char *path = request_path(state->request.uri);
         size_t prefix_length = sizeof(STATIC_PREFIX) - 1;
         if (strncmp(path, STATIC_PREFIX, prefix_length) == 0) {
-            status = open_static_file(state, root_fd, path + prefix_length, &content_type);
+            if (pool == NULL) {
+                status = 404;
+            } else {
+                status = file_pool_submit_open(pool, state->slot, state->connection_id,
+                                               path + prefix_length);
+            }
+            if (status == 0) {
+                state->file_pending = true;
+                return true;
+            }
         } else if (request_path_is(path, "/redirect/permanent")) {
             status = 301;
             extra_headers = "Location: /\r\n";
@@ -302,21 +191,130 @@ static bool queue_response(struct http_connection *state, int root_fd, int statu
         status = 303;
         extra_headers = "Location: /\r\n";
     }
-    int length;
-    if (state->file_fd != -1) {
-        length = http_write_file_headers(state->response, sizeof(state->response),
-                                         state->request.version, content_type,
-                                         (uintmax_t)state->file_remaining);
-    } else {
-        length = http_write_response(state->response, sizeof(state->response),
-                                     state->request.version, status, body, extra_headers);
+    int length = http_write_response(state->response, sizeof(state->response),
+                                     state->request.version, status, body, extra_headers,
+                                     state->keep_alive);
+    return prepare_response(state, length, status);
+}
+
+static bool dispatch_request(int queue, struct http_connection *state,
+                             struct file_pool *pool, int status)
+{
+    if (status != 200 && status != 405) {
+        return queue_response(state, pool, status);
     }
-    if (length < 0 || (size_t)length >= sizeof(state->response)) {
+    const char *path = request_path(state->request.uri);
+    if (strncmp(path, CGI_PREFIX, sizeof(CGI_PREFIX) - 1) != 0) {
+        return queue_response(state, pool, status);
+    }
+    if (!request_path_is(path, CGI_PREFIX "sum")) {
+        return queue_response(state, pool, 404);
+    }
+    if (strcmp(state->request.method, "GET") != 0) {
+        int length = http_write_response(state->response, sizeof(state->response),
+                                         state->request.version, 405, "", "Allow: GET\r\n",
+                                         state->keep_alive);
+        return prepare_response(state, length, 405);
+    }
+
+    const char *query = strchr(path, '?');
+    struct cgi_process *cgi = cgi_start_sum(query == NULL ? "" : query + 1,
+                                           state->request.version);
+    if (cgi == NULL) {
+        return queue_response(state, pool, 500);
+    }
+    struct kevent changes[2];
+    EV_SET(&changes[0], (uintptr_t)cgi->output_fd, EVFILT_READ, EV_ADD, 0, 0, state);
+    EV_SET(&changes[1], (uintptr_t)state->slot, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           0, CGI_TIMEOUT_MS, state);
+    if (kevent(queue, changes, 2, NULL, 0, NULL) == -1) {
+        perror("kevent: watch CGI");
+        cgi_dispose(cgi);
+        return queue_response(state, pool, 500);
+    }
+    state->cgi = cgi;
+    return true;
+}
+
+static void reset_request(struct http_connection *state, struct file_pool *pool)
+{
+    free(state->request.body);
+    state->request = (struct http_request){0};
+    if (state->file != NULL) {
+        file_pool_release(pool, state->file);
+        state->file = NULL;
+    }
+    state->header_length = 0;
+    state->headers_complete = false;
+    state->body_received = 0;
+    state->response_length = 0;
+    state->response_sent = 0;
+    state->interim_response = false;
+    state->keep_alive = false;
+    state->file_pending = false;
+    state->file_sent = 0;
+}
+
+static bool process_client_input(int queue, struct http_connection *state, struct file_pool *pool)
+{
+    size_t consumed = 0;
+    int status = read_request_bytes(state, state->input, state->input_length, &consumed);
+    state->input_length -= consumed;
+    if (state->input_length > 0 && consumed > 0) {
+        memmove(state->input, state->input + consumed, state->input_length);
+    }
+    if (status == 0) {
+        return true;
+    }
+    if ((status == 200 || status == 405) &&
+        (state->request.method == NULL || state->request.uri == NULL ||
+         state->request.version == NULL)) {
+        return queue_response(state, pool, 500);
+    }
+    if (status == 200) {
+        state->keep_alive = !state->request.connection_close &&
+                            (strcmp(state->request.version, "HTTP/1.1") == 0 ||
+                             state->request.connection_keep_alive);
+    }
+    return dispatch_request(queue, state, pool, status);
+}
+
+static void remove_timer(int queue, uintptr_t ident)
+{
+    struct kevent change;
+    EV_SET(&change, ident, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    if (kevent(queue, &change, 1, NULL, 0, NULL) == -1 && errno != ENOENT) {
+        perror("kevent: remove timer");
+    }
+}
+
+static void cancel_keep_alive_timer(int queue, struct http_connection *state)
+{
+    if (state->keep_alive_timer) {
+        remove_timer(queue, (uintptr_t)(MAX_CLIENTS + state->slot));
+        state->keep_alive_timer = false;
+    }
+}
+
+static bool finish_response(int queue, struct http_connection *state, struct file_pool *pool)
+{
+    if (!state->keep_alive) {
         return false;
     }
-    state->response_length = (size_t)length;
-    state->response_sent = 0;
-    state->interim_response = status == 100;
+    reset_request(state, pool);
+    if (state->input_length > 0) {
+        return process_client_input(queue, state, pool);
+    }
+
+    // CGI timers use slot numbers. Give keep-alive timers a separate range.
+    struct kevent change;
+    EV_SET(&change, (uintptr_t)(MAX_CLIENTS + state->slot), EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           0, KEEP_ALIVE_TIMEOUT_MS, state);
+    if (kevent(queue, &change, 1, NULL, 0, NULL) == -1) {
+        perror("kevent: watch keep-alive timeout");
+        return false;
+    }
+    state->keep_alive_timer = true;
     return true;
 }
 
@@ -326,48 +324,47 @@ static bool can_retry_socket_io(bool hangup)
            ((errno == EAGAIN || errno == EWOULDBLOCK) && !hangup);
 }
 
-static bool send_file_chunk(struct http_connection *state, bool hangup)
+static bool send_file_chunk(int queue, struct http_connection *state, struct file_pool *pool,
+                            bool hangup)
 {
-    if (state->file_sent == state->file_length) {
-        size_t length = sizeof(state->file_buffer);
-        if (state->file_remaining < (off_t)length) {
-            length = (size_t)state->file_remaining;
-        }
-        ssize_t count = read(state->file_fd, state->file_buffer, length);
-        if (count <= 0) {
-            return count < 0 && errno == EINTR;
-        }
-        state->file_length = (size_t)count;
-        state->file_sent = 0;
-    }
-
-    ssize_t sent = send(state->fd, state->file_buffer + state->file_sent,
-                        state->file_length - state->file_sent, 0);
+    struct file_job *job = state->file;
+    ssize_t sent = send(state->fd, job->data + state->file_sent,
+                        job->length - state->file_sent, 0);
     if (sent <= 0) {
         return sent < 0 && can_retry_socket_io(hangup);
     }
     state->file_sent += (size_t)sent;
-    state->file_remaining -= (off_t)sent;
-    return state->file_remaining > 0;
+    job->remaining -= (off_t)sent;
+    if (job->remaining == 0) {
+        return finish_response(queue, state, pool);
+    }
+    if (state->file_sent == job->length) {
+        state->file = NULL;
+        state->file_pending = true;
+        file_pool_submit_read(pool, job);
+    }
+    return true;
 }
 
-static bool handle_client(struct http_connection *state, int root_fd, bool hangup)
+static bool handle_client(int queue, struct http_connection *state, struct file_pool *pool,
+                          bool hangup)
 {
     if (state->response_length == 0) {
-        char data[BUFFER_SIZE];
-        ssize_t received = recv(state->fd, data, sizeof(data), 0);
+        ssize_t received = recv(state->fd, state->input + state->input_length,
+                                sizeof(state->input) - state->input_length, 0);
         if (received > 0) {
-            int status = read_request_bytes(state, data, (size_t)received);
-            return status == 0 || queue_response(state, root_fd, status);
+            cancel_keep_alive_timer(queue, state);
+            state->input_length += (size_t)received;
+            return process_client_input(queue, state, pool);
         }
         if (received == 0) {
-            return state->header_length > 0 && queue_response(state, root_fd, 400);
+            return state->header_length > 0 && queue_response(state, pool, 400);
         }
         return can_retry_socket_io(hangup);
     }
 
     if (state->response_sent == state->response_length) {
-        return send_file_chunk(state, hangup);
+        return send_file_chunk(queue, state, pool, hangup);
     }
 
     ssize_t sent = send(state->fd, state->response + state->response_sent,
@@ -386,15 +383,27 @@ static bool handle_client(struct http_connection *state, int root_fd, bool hangu
         state->interim_response = false;
         return true;
     }
-    return state->file_remaining > 0;
+    if (state->file != NULL && state->file->remaining > 0) {
+        return true;
+    }
+    return finish_response(queue, state, pool);
 }
 
-static void close_client(struct http_connection *client)
+static void discard_cgi(int queue, struct http_connection *client)
 {
-    free(client->request.body);
-    if (client->file_fd != -1) {
-        close(client->file_fd);
+    if (client->cgi == NULL) {
+        return;
     }
+    remove_timer(queue, (uintptr_t)client->slot);
+    cgi_dispose(client->cgi);
+    client->cgi = NULL;
+}
+
+static void close_client(int queue, struct http_connection *client, struct file_pool *pool)
+{
+    cancel_keep_alive_timer(queue, client);
+    reset_request(client, pool);
+    discard_cgi(queue, client);
     close(client->fd);
     client->fd = -1;
 }
@@ -421,13 +430,18 @@ static int accept_client(int server_fd, struct http_connection clients[])
         close(fd);
         return ACCEPT_RETRY;
     }
-    if (set_nonblocking(fd) == -1) {
+    if (configure_socket(fd) == -1) {
         perror("fcntl");
         close(fd);
         return ACCEPT_RETRY;
     }
 
-    clients[slot] = (struct http_connection){.fd = fd, .file_fd = -1};
+    clients[slot] = (struct http_connection){
+        .fd = fd,
+        .slot = slot,
+        .connection_id = clients[slot].connection_id + 1,
+        .filter = EVFILT_READ,
+    };
     return slot;
 }
 
@@ -438,32 +452,204 @@ static int watch_read(int queue, int fd, struct http_connection *client)
     return kevent(queue, &change, 1, NULL, 0, NULL);
 }
 
-static void service_kqueue_client(int queue, int root_fd, const struct kevent *event)
+static bool set_client_filter(int queue, struct http_connection *client, short next_filter)
+{
+    if (client->filter == next_filter) {
+        return true;
+    }
+    struct kevent changes[2];
+    int count = 0;
+    if (client->filter != 0) {
+        EV_SET(&changes[count], (uintptr_t)client->fd, client->filter, EV_DELETE, 0, 0, NULL);
+        count++;
+    }
+    if (next_filter != 0) {
+        EV_SET(&changes[count], (uintptr_t)client->fd, next_filter, EV_ADD, 0, 0, client);
+        count++;
+    }
+    if (kevent(queue, changes, count, NULL, 0, NULL) == -1) {
+        perror("kevent: change client filter");
+        return false;
+    }
+    client->filter = next_filter;
+    return true;
+}
+
+static void service_kqueue_client(int queue, struct file_pool *pool, const struct kevent *event)
 {
     struct http_connection *client = event->udata;
+    if (client->fd == -1 || event->ident != (uintptr_t)client->fd ||
+        event->filter != client->filter) {
+        return;
+    }
     bool hangup = (event->flags & EV_EOF) != 0;
-    if ((event->flags & EV_ERROR) || !handle_client(client, root_fd, hangup)) {
-        close_client(client);
+    if ((event->flags & EV_ERROR) || !handle_client(queue, client, pool, hangup)) {
+        close_client(queue, client, pool);
         return;
     }
 
-    short next_filter = client->response_length > 0 ? EVFILT_WRITE : EVFILT_READ;
-    if (event->filter != next_filter) {
-        struct kevent changes[2];
-        EV_SET(&changes[0], event->ident, event->filter, EV_DELETE, 0, 0, NULL);
-        EV_SET(&changes[1], event->ident, next_filter, EV_ADD, 0, 0, client);
-        if (kevent(queue, changes, 2, NULL, 0, NULL) == -1) {
-            perror("kevent: change client filter");
-            close_client(client);
+    short next_filter = EVFILT_READ;
+    if (client->file_pending || client->cgi != NULL) {
+        next_filter = 0;
+    } else if (client->response_length > 0) {
+        next_filter = EVFILT_WRITE;
+    }
+    if (!set_client_filter(queue, client, next_filter)) {
+        close_client(queue, client, pool);
+    }
+}
+
+static bool finish_file_job(struct http_connection *client, struct file_pool *pool,
+                            struct file_job *job)
+{
+    client->file_pending = false;
+    if (job->status != 200) {
+        int status = job->status;
+        file_pool_release(pool, job);
+        // Once the headers have been sent, a failed read ends the response.
+        return client->response_length == 0 && queue_response(client, pool, status);
+    }
+
+    client->file = job;
+    client->file_sent = 0;
+    if (client->response_length > 0) {
+        return true;
+    }
+    int length = http_write_file_headers(client->response, sizeof(client->response),
+                                        client->request.version, job->content_type,
+                                        (uintmax_t)job->remaining,
+                                        "Cache-Control: public, max-age=60\r\n", client->keep_alive);
+    return prepare_response(client, length, 200);
+}
+
+static bool service_file_completions(int queue, struct file_pool *pool,
+                                     struct http_connection clients[])
+{
+    if (file_pool_drain_notifications(pool) == -1) {
+        perror("read: file completion");
+        return false;
+    }
+
+    struct file_job *job;
+    while ((job = file_pool_take_completed(pool)) != NULL) {
+        struct http_connection *client = &clients[job->slot];
+        if (client->fd == -1 || client->connection_id != job->connection_id ||
+            !client->file_pending) {
+            file_pool_release(pool, job);
+            continue;
+        }
+        if (!finish_file_job(client, pool, job) ||
+            !set_client_filter(queue, client, EVFILT_WRITE)) {
+            close_client(queue, client, pool);
+        }
+    }
+    return true;
+}
+
+static void complete_cgi(int queue, struct file_pool *pool, struct http_connection *client,
+                         int error_status)
+{
+    bool prepared = false;
+    if (error_status == 0) {
+        int length = cgi_write_response(client->cgi, client->response,
+                                        sizeof(client->response), client->request.version,
+                                        client->keep_alive);
+        prepared = prepare_response(client, length, 200);
+        error_status = 500;
+    }
+    discard_cgi(queue, client);
+    if ((!prepared && !queue_response(client, pool, error_status)) ||
+        !set_client_filter(queue, client, EVFILT_WRITE)) {
+        close_client(queue, client, pool);
+    }
+}
+
+static void complete_cgi_if_ready(int queue, struct file_pool *pool,
+                                  struct http_connection *client)
+{
+    struct cgi_process *cgi = client->cgi;
+    if (cgi->pid == 0 && (cgi->output_fd == -1 || !cgi->exited_ok)) {
+        complete_cgi(queue, pool, client, 0);
+    }
+}
+
+static void record_cgi_exit(struct cgi_process *cgi, int status)
+{
+    cgi->pid = 0;
+    cgi->exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void service_cgi_output(int queue, struct file_pool *pool,
+                               struct http_connection *client, const struct kevent *event)
+{
+    struct cgi_process *cgi = client->cgi;
+    int result = event->flags & EV_ERROR ? -1 : cgi_read_output(cgi);
+    if (result < 0) {
+        complete_cgi(queue, pool, client, 500);
+    } else if (result > 0) {
+        if (cgi->pid > 0) {
+            int status;
+            pid_t finished;
+            do {
+                finished = waitpid(cgi->pid, &status, WNOHANG);
+            } while (finished == -1 && errno == EINTR);
+            if (finished > 0) {
+                record_cgi_exit(cgi, status);
+            }
+        }
+        complete_cgi_if_ready(queue, pool, client);
+    }
+}
+
+static void reap_cgi_children(int queue, struct file_pool *pool,
+                              struct http_connection clients[])
+{
+    for (;;) {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid == -1 && errno == EINTR) {
+            continue;
+        }
+        if (pid <= 0) {
+            return;
+        }
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            struct http_connection *client = &clients[i];
+            if (client->cgi != NULL && client->cgi->pid == pid) {
+                record_cgi_exit(client->cgi, status);
+                complete_cgi_if_ready(queue, pool, client);
+                break;
+            }
         }
     }
 }
 
-static int run_server(int server_fd, int root_fd)
+static int run_server(int server_fd, struct file_pool *pool)
 {
     int queue = kqueue();
     if (queue == -1) {
         perror("kqueue");
+        return 1;
+    }
+    if (fcntl(queue, F_SETFD, FD_CLOEXEC) == -1) {
+        perror("fcntl: kqueue");
+        close(queue);
+        return 1;
+    }
+    struct kevent signals[3];
+    EV_SET(&signals[0], SIGCHLD, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+    EV_SET(&signals[1], SIGINT, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+    EV_SET(&signals[2], SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+    if (kevent(queue, signals, 3, NULL, 0, NULL) == -1) {
+        perror("kevent: watch signals");
+        close(queue);
+        return 1;
+    }
+    struct sigaction stop = {.sa_handler = handle_stop_signal};
+    sigemptyset(&stop.sa_mask);
+    if (sigaction(SIGINT, &stop, NULL) == -1 || sigaction(SIGTERM, &stop, NULL) == -1) {
+        perror("sigaction");
+        close(queue);
         return 1;
     }
     if (watch_read(queue, server_fd, NULL) == -1) {
@@ -471,15 +657,25 @@ static int run_server(int server_fd, int root_fd)
         close(queue);
         return 1;
     }
+    int notification_fd = -1;
+    if (pool != NULL) {
+        notification_fd = file_pool_notification_fd(pool);
+        if (watch_read(queue, notification_fd, NULL) == -1) {
+            perror("kevent: watch file completion");
+            close(queue);
+            return 1;
+        }
+    }
 
-    struct http_connection clients[MAX_CLIENTS];
+    struct http_connection clients[MAX_CLIENTS] = {0};
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
     }
 
-    struct kevent events[MAX_CLIENTS + 1];
+    struct kevent events[MAX_EVENTS];
+    int exit_status = 1;
     for (;;) {
-        int count = kevent(queue, NULL, 0, events, MAX_CLIENTS + 1, NULL);
+        int count = kevent(queue, NULL, 0, events, MAX_EVENTS, NULL);
         if (count == -1) {
             if (errno == EINTR) {
                 continue;
@@ -490,10 +686,41 @@ static int run_server(int server_fd, int root_fd)
 
         const struct kevent *listener = NULL;
         for (int i = 0; i < count; i++) {
-            if (events[i].udata == NULL) {
-                listener = &events[i];
+            const struct kevent *event = &events[i];
+            if (event->filter == EVFILT_SIGNAL) {
+                if (event->ident == SIGCHLD) {
+                    reap_cgi_children(queue, pool, clients);
+                } else {
+                    exit_status = 0;
+                    goto close_connections;
+                }
+            } else if (event->filter == EVFILT_TIMER) {
+                struct http_connection *client = event->udata;
+                if (event->ident >= MAX_CLIENTS) {
+                    if (client->keep_alive_timer) {
+                        client->keep_alive_timer = false;
+                        close_client(queue, client, pool);
+                    }
+                } else if (client->cgi != NULL) {
+                    complete_cgi(queue, pool, client, 504);
+                }
+            } else if (event->ident == (uintptr_t)server_fd) {
+                listener = event;
+            } else if (event->ident == (uintptr_t)notification_fd) {
+                if (event->flags & EV_ERROR) {
+                    fputs("File completion pipe failed\n", stderr);
+                    goto close_connections;
+                }
+                if (!service_file_completions(queue, pool, clients)) {
+                    goto close_connections;
+                }
             } else {
-                service_kqueue_client(queue, root_fd, &events[i]);
+                struct http_connection *client = event->udata;
+                if (client->cgi != NULL && event->ident == (uintptr_t)client->cgi->output_fd) {
+                    service_cgi_output(queue, pool, client, event);
+                } else {
+                    service_kqueue_client(queue, pool, event);
+                }
             }
         }
 
@@ -512,17 +739,22 @@ static int run_server(int server_fd, int root_fd)
         }
         if (slot >= 0 && watch_read(queue, clients[slot].fd, &clients[slot]) == -1) {
             perror("kevent: watch client");
-            close_client(&clients[slot]);
+            close_client(queue, &clients[slot], pool);
+        }
+    }
+
+close_connections:
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd != -1) {
+            close_client(queue, &clients[i], pool);
         }
     }
     close(queue);
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd != -1) {
-            close_client(&clients[i]);
-        }
-    }
-    return 1;
+    pid_t child;
+    do {
+        child = waitpid(-1, NULL, 0);
+    } while (child > 0 || (child == -1 && errno == EINTR));
+    return exit_status;
 }
 
 int main(int argc, char *argv[])
@@ -532,17 +764,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR || signal(SIGCHLD, SIG_DFL) == SIG_ERR) {
         perror("signal");
         return 1;
     }
-
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         perror("socket");
         return 1;
     }
-    if (set_nonblocking(server_fd) == -1) {
+    if (configure_socket(server_fd) == -1) {
         perror("fcntl");
         close(server_fd);
         return 1;
@@ -578,6 +809,7 @@ int main(int argc, char *argv[])
     }
 
     int root_fd = -1;
+    struct file_pool *pool = NULL;
     if (argc == 2) {
         root_fd = open(argv[1], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (root_fd == -1) {
@@ -585,12 +817,20 @@ int main(int argc, char *argv[])
             close(server_fd);
             return 1;
         }
+        pool = file_pool_create(root_fd, MAX_CLIENTS);
+        if (pool == NULL) {
+            perror("file worker pool");
+            close(root_fd);
+            close(server_fd);
+            return 1;
+        }
     }
 
     puts("HTTP server listening on http://127.0.0.1:8080");
 
-    int result = run_server(server_fd, root_fd);
-    if (root_fd != -1) {
+    int result = run_server(server_fd, pool);
+    if (pool != NULL) {
+        file_pool_destroy(pool);
         close(root_fd);
     }
     close(server_fd);

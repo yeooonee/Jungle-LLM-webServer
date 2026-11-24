@@ -215,6 +215,12 @@ int http_parse_headers(char *headers, struct http_request *request,
         }
         value = trim_whitespace(value);
 
+        if (strcasecmp(line, "Authorization") == 0 || strcasecmp(line, "Cookie") == 0 ||
+            strcasecmp(line, "Range") == 0 || strncasecmp(line, "If-", 3) == 0 ||
+            strcasecmp(line, "Cache-Control") == 0 || strcasecmp(line, "Pragma") == 0) {
+            request->bypass_cache = true;
+        }
+
         if (strcasecmp(line, "Host") == 0) {
             if (request->host != NULL || !is_host_value(value)) {
                 return 400;
@@ -270,20 +276,19 @@ int http_parse_headers(char *headers, struct http_request *request,
 
 static int write_response(char *response, size_t capacity, const char *version,
                           int status, const char *body, uintmax_t body_length,
-                          const char *content_type, const char *extra_headers)
+                          const char *content_type, const char *extra_headers, bool keep_alive)
 {
     const char *protocol = version == NULL ? "HTTP/1.1" : version;
+    const char *connection = keep_alive ? "keep-alive" : "close";
     if (status == 100) {
         return snprintf(response, capacity, "HTTP/1.1 100 Continue\r\n\r\n");
     }
     if (status == 304) {
-        return snprintf(response, capacity, "%s 304 Not Modified\r\n%sConnection: close\r\n\r\n",
-                        protocol, extra_headers);
+        return snprintf(response, capacity, "%s 304 Not Modified\r\n%sConnection: %s\r\n\r\n",
+                        protocol, extra_headers, connection);
     }
 
     const char *reason;
-    const char *allow = "";
-
     switch (status) {
     case 200: reason = "OK"; break;
     case 301: reason = "Moved Permanently"; break;
@@ -292,34 +297,49 @@ static int write_response(char *response, size_t capacity, const char *version,
     case 400: reason = "Bad Request"; break;
     case 403: reason = "Forbidden"; break;
     case 404: reason = "Not Found"; break;
-    case 405: reason = "Method Not Allowed"; allow = "Allow: GET, POST\r\n"; break;
+    case 405: reason = "Method Not Allowed"; break;
     case 413: reason = "Content Too Large"; break;
     case 417: reason = "Expectation Failed"; break;
     case 431: reason = "Request Header Fields Too Large"; break;
     case 501: reason = "Not Implemented"; break;
+    case 502: reason = "Bad Gateway"; break;
+    case 503: reason = "Service Unavailable"; break;
+    case 504: reason = "Gateway Timeout"; break;
     case 505: reason = "HTTP Version Not Supported"; break;
     default: status = 500; reason = "Internal Server Error"; break;
     }
 
     return snprintf(response, capacity,
                     "%s %d %s\r\n%s%s%sContent-Length: %" PRIuMAX
-                    "\r\nConnection: close\r\n%s%s\r\n%s",
+                    "\r\nConnection: %s\r\n%s\r\n%s",
                     protocol, status, reason,
                     content_type ? "Content-Type: " : "", content_type ? content_type : "",
                     content_type ? "\r\n" : "", body_length,
-                    extra_headers, allow, body);
+                    connection, extra_headers, body);
 }
 
 int http_write_response(char *response, size_t capacity, const char *version,
-                        int status, const char *body, const char *extra_headers)
+                        int status, const char *body, const char *extra_headers,
+                        bool keep_alive)
+{
+    if (status == 405 && *extra_headers == '\0') {
+        extra_headers = "Allow: GET, POST\r\n";
+    }
+    return write_response(response, capacity, version, status, body, strlen(body),
+                          *body ? "text/plain" : NULL, extra_headers, keep_alive);
+}
+
+int http_write_json_response(char *response, size_t capacity, const char *version,
+                             int status, const char *body, bool keep_alive)
 {
     return write_response(response, capacity, version, status, body, strlen(body),
-                          *body ? "text/plain" : NULL, extra_headers);
+                          "application/json", "", keep_alive);
 }
 
 int http_write_file_headers(char *response, size_t capacity, const char *version,
-                            const char *content_type, uintmax_t file_size)
+                            const char *content_type, uintmax_t file_size,
+                            const char *extra_headers, bool keep_alive)
 {
     return write_response(response, capacity, version, 200, "", file_size,
-                          content_type, "");
+                          content_type, extra_headers, keep_alive);
 }
