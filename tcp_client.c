@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+enum { SERVER_PORT = 9000 };
+
 static int set_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL);
@@ -146,8 +148,8 @@ int main(int argc, char *argv[])
     }
     char headers[HTTP_MAX_HEADERS + 1];
     int header_length = snprintf(headers, sizeof(headers),
-        "%s %s HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n%s\r\n",
-        argv[1], argv[2], content_headers);
+        "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n%s\r\n",
+        argv[1], argv[2], SERVER_PORT, content_headers);
     if (header_length < 0 || (size_t)header_length >= sizeof(headers)) {
         fputs("Request headers are too large\n", stderr);
         return 1;
@@ -171,7 +173,7 @@ int main(int argc, char *argv[])
 
     struct sockaddr_in address = {0};
     address.sin_family = AF_INET;
-    address.sin_port = htons(8080);
+    address.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
         fputs("Invalid IPv4 address\n", stderr);
         close(client_fd);

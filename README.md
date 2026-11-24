@@ -44,7 +44,15 @@ HTTP 응답은 상태 라인, 헤더, 본문 순서로 전송합니다. 최종 �
 
 **정적 콘텐츠 오프로딩(static content offloading)**은 이미지·CSS·JS 같은 파일을 앞단의 C 서버에서 직접 제공해 백엔드의 부담을 줄이는 방식입니다. C 서버는 미리 배포한 파일을 첫 요청부터 읽어 보낼 수 있습니다. [Microsoft의 리버스 프록시 설명](https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/linux-nginx?view=aspnetcore-10.0)
 
-예를 들어 페이지가 `style.css`, `app.js`, `logo.png`, `/api/users/7`을 요청하면 C 서버가 파일 3개를 보내고 Flask에는 API 요청 1개만 전달하는 구조입니다. 파일 요청에 대한 C 서버와 Flask 사이의 왕복이 줄고, Flask는 DB 조회 같은 API 처리에 워커를 쓸 수 있습니다.
+포워드 프록시를 `./tcp_server_forward -o 9200 ./public`으로 실행하면, 리버스 프록시 `:9200`를 목적지로 하는 GET 요청을 아래와 같이 처리합니다. 파일 워커가 로컬 파일을 읽고, `kqueue` 이벤트 루프가 응답을 전송합니다. [오프로딩 요청 분기](tcp_server_forward.c#L386)
+
+| 요청 경로 | 응답을 만드는 서버 |
+| --- | --- |
+| `/static/index.html` | 리버스 프록시가 고른 C 원 서버 `:9000` 또는 `:9001` |
+| `/static/logo.png` | 포워드 프록시 `:9100`이 `./public/logo.png`를 읽음 |
+| `/static/style.css` | 포워드 프록시 `:9100`이 `./public/style.css`를 읽음 |
+
+브라우저는 원 서버에서 받은 HTML을 읽은 뒤 로고와 CSS를 별도로 요청합니다. 두 파일은 첫 요청부터 포워드 프록시가 직접 보냅니다. 오프로딩이 켜져 있는 동안 `index.html` 요청은 포워드 캐시를 건너뛰고 원 서버로 중계됩니다.
 
 #### 동적 요청 처리
 
@@ -53,15 +61,15 @@ HTTP 응답은 상태 라인, 헤더, 본문 순서로 전송합니다. 최종 �
 프로젝트 폴더에서 `make`를 실행하면 서버와 함께 `cgi_sum`이 빌드됩니다. `./tcp_server`를 실행한 뒤 다른 터미널에서 요청을 보냅니다.
 
 ```sh
-curl -i 'http://127.0.0.1:8080/cgi-bin/sum?a=3&b=5'
+curl -i 'http://127.0.0.1:9000/cgi-bin/sum?a=3&b=5'
 ```
 
 - `GET /cgi-bin/sum` 요청이 오면 서버는 `fork()`와 `execve()`로 `./cgi_sum`을 실행하고, `QUERY_STRING`으로 `a=3&b=5`를 전달합니다. 프로그램은 두 정수를 더해 `{"sum":8}`을 표준 출력으로 보냅니다. [CGI 실행](cgi.c#L12) · [덧셈 프로그램](cgi_sum.c#L44)
 - 서버는 출력 파이프를 `kqueue`의 `EVFILT_READ`로 감시합니다. 읽을 데이터가 생기면 파이프에서 받고, 자식 종료 상태를 회수한 뒤 응답을 보냅니다. 입력이 잘못되면 `400`, 실행이나 출력 처리에 실패하면 `500`, 실행이 5초를 넘기면 `504`를 반환합니다. [출력 처리](tcp_server.c#L581) · [이벤트 분기](tcp_server.c#L686)
 
-##### Flask 백엔드 전달 설계
+##### 리버스 프록시를 통한 동적 요청
 
-추가할 리버스 프록시에서는 `/api/` 요청을 Flask 백엔드에 전달합니다. 예를 들어 `GET /api/users/7`이 오면 Flask가 DB에서 7번 회원을 조회해 JSON 응답을 만듭니다. C 서버는 Flask가 보낸 상태 코드와 응답 본문을 브라우저에 전달합니다. 원 서버인 `tcp_server.c`는 `/static/` 요청을 파일 스레드풀로 처리합니다.
+리버스 프록시는 `/cgi-bin/sum?a=3&b=5`의 경로와 쿼리를 선택한 C 원 서버에 그대로 보냅니다. 원 서버가 CGI 프로그램을 실행해 JSON을 생성하면 리버스 프록시가 상태 코드, 헤더, 본문을 요청한 쪽에 전달합니다.
 
 #### 동시 요청 처리
 
@@ -103,7 +111,7 @@ kevent(queue, NULL, 0, events, MAX_EVENTS, NULL);
 
 ### Proxy 또는 Reverse Proxy 구현
 
-과제에서는 두 방식 중 하나 이상을 구현합니다. 이 프로젝트에서는 경로 기반 리버스 프록시를 설계하고 있습니다.
+이 프로젝트는 HTTP 포워드 프록시와 두 C 원 서버에 요청을 분산하는 리버스 프록시를 구현합니다.
 
 #### 포워드 프록시
 
@@ -111,10 +119,10 @@ kevent(queue, NULL, 0, events, MAX_EVENTS, NULL);
 
 ##### 로컬 HTTP 중계
 
-이 포워드 프록시는 **HTTP 전용**입니다. 로컬 원 서버 `http://127.0.0.1:8080`으로 향하는 `GET`을 지원하며, HTTPS 터널링(`CONNECT`)은 구현 범위에서 제외합니다.
+이 포워드 프록시는 **HTTP 전용**입니다. 기본 목적지는 `http://127.0.0.1:9000`이며, `-o 9200`를 주면 로컬 리버스 프록시로 `GET`을 보낼 수 있습니다. HTTPS 터널링(`CONNECT`)은 구현 범위에서 제외합니다.
 
-- **GET 중계** · `curl → 프록시 :8081 → 원 서버 :8080` 순서로 요청이 이동합니다. 캐시에 응답이 없으면 프록시가 전체 URL에서 경로와 쿼리를 꺼내 `Host`와 `Connection: keep-alive`를 붙여 원 서버에 보냅니다. 원 서버의 응답은 프록시를 거쳐 `curl`로 돌아옵니다. 송수신은 `kqueue`로 처리합니다. [원 서버 연결](tcp_server_forward.c#L339)
-- **원 서버 연결 재사용** · `Content-Length`만큼 본문을 다 전달한 뒤 두 연결이 모두 유지되면, 같은 클라이언트의 다음 중계 요청에 기존 원 서버 소켓을 씁니다. 원 서버가 연결을 닫으면 다음 중계 요청에서 새로 연결합니다. [응답 완료와 소켓 재사용](tcp_server_forward.c#L564)
+- **GET 중계** · `curl → 프록시 :9100 → 원 서버 :9000` 순서로 요청이 이동합니다. 캐시에 응답이 없으면 프록시가 전체 URL에서 경로와 쿼리를 꺼내 `Host`와 `Connection: keep-alive`를 붙여 원 서버에 보냅니다. 원 서버의 응답은 프록시를 거쳐 `curl`로 돌아옵니다. 송수신은 `kqueue`로 처리합니다. [원 서버 연결](tcp_server_forward.c#L351)
+- **원 서버 연결 재사용** · `Content-Length`만큼 본문을 다 전달한 뒤 두 연결이 모두 유지되면, 같은 클라이언트의 다음 중계 요청에 기존 원 서버 소켓을 씁니다. 원 서버가 연결을 닫으면 다음 중계 요청에서 새로 연결합니다. [응답 완료와 소켓 재사용](tcp_server_forward.c#L585)
 
 `204`와 `304`는 헤더에서 응답이 끝납니다. 연결 종료로 본문 길이를 표시하는 응답은 EOF까지 중계합니다. `Transfer-Encoding: chunked`는 현재 지원 범위에서 제외됩니다.
 
@@ -124,9 +132,9 @@ kevent(queue, NULL, 0, events, MAX_EVENTS, NULL);
 make tcp_server tcp_server_forward
 ./tcp_server ./public
 ./tcp_server_forward
-curl -v --noproxy '' -x http://127.0.0.1:8081 \
-  http://127.0.0.1:8080/static/index.html \
-  http://127.0.0.1:8080/static/logo.png -o /dev/null -o /dev/null
+curl -v --noproxy '' -x http://127.0.0.1:9100 \
+  http://127.0.0.1:9000/static/index.html \
+  http://127.0.0.1:9000/static/logo.png -o /dev/null -o /dev/null
 ```
 
 ##### 캐시 정책
@@ -152,28 +160,49 @@ curl -v --noproxy '' -x http://127.0.0.1:8081 \
 
 캐시는 최대 16개 응답을 보관합니다. 저장 중인 응답과 이미 저장된 응답을 포함한 메모리 한도는 8 MiB입니다. 공간이 부족하면 만료 항목부터 제거하고, 추가 공간이 필요하면 최근 사용 시점이 가장 오래된 항목부터 제거합니다(LRU). 새 응답을 받을 공간을 확보할 수 없으면 그 응답은 클라이언트에 전달만 합니다. [메모리 한도와 제거](proxy_cache.c#L134)
 
-프록시를 새로 실행한 상태에서 다음 명령으로 같은 URL을 세 번 요청하면, 세 번째 응답의 `Age` 헤더로 캐시 사용 여부를 확인할 수 있습니다.
+앞의 로컬 HTTP 중계 예제처럼 포워드 프록시를 `./tcp_server_forward`로 새로 실행한 상태에서 같은 URL을 세 번 요청하면, 세 번째 응답의 `Age` 헤더로 캐시 사용 여부를 확인할 수 있습니다.
 
 ```sh
-url='http://127.0.0.1:8080/static/index.html'
+url='http://127.0.0.1:9000/static/index.html'
 for i in 1 2 3; do
-  curl -sS -D - -o /dev/null --noproxy '' -x http://127.0.0.1:8081 "$url"
+  curl -sS -D - -o /dev/null --noproxy '' -x http://127.0.0.1:9100 "$url"
 done
 ```
 
-#### 리버스 프록시 설계
+#### 리버스 프록시와 Round-Robin
 
-```text
-브라우저 → C 리버스 프록시 → Flask → DB 조회
-브라우저 ← C 리버스 프록시 ← Flask ← 조회 결과
+![로고와 CSS는 포워드 프록시 9100에서 직접 응답하고, HTML과 CGI 요청은 리버스 프록시 9200이 C 원 서버 9000과 9001에 번갈아 전달하는 흐름](.visualizations/proxy-request-routes-horizontal.png)
+
+`tcp_server.c`로 빌드한 같은 서버를 두 포트에서 실행합니다. 리버스 프록시가 중계할 때마다 `9000 → 9001 → 9000` 순서로 원 서버 하나를 선택합니다. `/static/index.html`과 `/cgi-bin/` 요청이 리버스 프록시에 도착하면, 선택한 원 서버가 경로에 맞는 서비스를 처리합니다. [Round-Robin 선택](tcp_server_reverse.c#L148)
+
+리버스 프록시는 한 `kqueue`에서 양쪽 소켓을 감시하고, 부분 송수신 위치를 유지하면서 HTTP 응답을 중계합니다. 리버스 프록시에 직접 요청하면 `GET`과 `POST`를 중계할 수 있으며, 포워드 프록시를 거치는 예시는 `GET`을 사용합니다. [원 서버 이벤트 처리](tcp_server_reverse.c#L631)
+
+##### 원 서버 연결 확인과 헬스 체크
+
+- **현재 연결 확인** · Round-Robin으로 원 서버를 고른 뒤 논블로킹 `connect()`를 호출합니다. 연결이 진행 중이면 `EVFILT_WRITE` 이벤트에서 `SO_ERROR`가 `0`인지 확인한 뒤 HTTP 요청을 보냅니다. [TCP 연결 확인](tcp_server_reverse.c#L551)
+- **실패한 서버를 선택한 경우** · `9001`이 꺼져 있으면 그 서버를 고른 요청은 `502`를 받습니다. 다음 요청은 순서대로 `9000`으로 갑니다. 응답을 보내기 전에 원 서버와 송수신이 5초간 진행되지 않으면 `504`를 반환합니다.
+- **헬스 체크를 추가하는 경우** · 실제 요청과 별도로 각 원 서버에 주기적으로 `GET /health`를 보내고, `200 OK`를 받은 서버만 Round-Robin 대상으로 고를 수 있습니다. 이렇게 하면 매 요청마다 확인용 HTTP 왕복을 추가하지 않고도 장애 서버를 선택에서 제외할 수 있습니다. 현재 구현은 요청마다 TCP 연결을 확인하는 방식입니다.
+
+빌드한 뒤 네 프로세스를 각각 다른 터미널에서 실행합니다.
+
+```sh
+make tcp_server tcp_server_forward tcp_server_reverse
+./tcp_server -p 9000 ./public
+./tcp_server -p 9001 ./public
+./tcp_server_reverse
+./tcp_server_forward -o 9200 ./public
 ```
 
-리버스 프록시는 백엔드 중계 용도로 개발 중입니다. 브라우저 소켓과 Flask 소켓을 같은 `kqueue`에서 감시할 예정입니다. [작업용 이벤트 루프](tcp_server_reverse.c#L383)
+다른 터미널에서 캐시 대상이 아닌 CGI 응답을 세 번 요청합니다. 새로 시작한 리버스 프록시의 응답 헤더에 `X-Backend-Port`가 `9000`, `9001`, `9000` 순서로 표시됩니다.
 
-1. **연결합니다.** 브라우저 요청을 받은 뒤 Flask에 논블로킹 `connect()`를 호출합니다. 연결이 진행 중이면 `EVFILT_WRITE`를 감시하고, 이벤트가 도착하면 `SO_ERROR`로 연결 성공 여부를 확인합니다.
-2. **요청을 전달합니다.** Flask 소켓에 `send()`로 요청을 보냅니다. 일부만 보냈다면 다음 `EVFILT_WRITE`에서 이어 보내고, 다 보냈으면 `EVFILT_READ`로 전환합니다.
-3. **백엔드 응답을 읽습니다.** Flask가 DB를 조회하는 동안 이벤트 루프는 다른 연결을 처리합니다. Flask 소켓에 `EVFILT_READ`가 오면 `recv()`로 응답을 읽습니다.
-4. **브라우저에 응답합니다.** 읽은 응답은 브라우저 소켓의 `EVFILT_WRITE`에서 보냅니다. 전송 위치를 연결 상태에 저장해 다음 이벤트에서 이어 보낼 수 있습니다.
+```sh
+for i in 1 2 3; do
+  curl -sS -D - -o /dev/null --noproxy '' -x http://127.0.0.1:9100 \
+    'http://127.0.0.1:9200/cgi-bin/sum?a=3&b=5' | grep -i '^X-Backend-Port:'
+done
+```
+
+백엔드 포트 목록은 리버스 프록시에 `-b`를 반복해 지정할 수 있습니다. `-b 9000 -b 9001`은 기본 목록과 같은 순서입니다.
 
 ### 기술 스택과 제한
 
@@ -183,13 +212,13 @@ done
 
 `make`로 빌드한 뒤 `./tcp_server`를 실행합니다. 다른 터미널에서 `./tcp_client GET /` 또는 `./tcp_client POST /submit 'hello'`로 요청을 보낼 수 있습니다.
 
-정적 파일을 제공하려면 `./tcp_server ./public`처럼 루트 디렉토리를 인자로 넘깁니다. 현재 서버의 주소는 `127.0.0.1:8080`입니다.
+정적 파일을 제공하려면 `./tcp_server ./public`처럼 루트 디렉토리를 인자로 넘깁니다. 기본 주소는 `127.0.0.1:9000`이고, `-p`로 수신 포트를 지정할 수 있습니다.
 
-프록시 작업용 서버는 `make tcp_server_forward tcp_server_reverse`로 빌드합니다. 기본 수신 포트는 포워드 `8081`, 리버스 `8082`이고, `-p`에 `1`부터 `65535`까지의 포트를 지정할 수 있습니다.
+프록시 작업용 서버는 `make tcp_server_forward tcp_server_reverse`로 빌드합니다. 기본 수신 포트는 포워드 `9100`, 리버스 `9200`이고, `-p`에 `1`부터 `65535`까지의 포트를 지정할 수 있습니다.
 
 ```sh
-./tcp_server_forward -p 9001
-./tcp_server_reverse -p 9002
+./tcp_server_forward -p 9100 -o 9200 ./public
+./tcp_server_reverse -p 9200 -b 9000 -b 9001
 ```
 
 ### 개발 환경
@@ -235,7 +264,7 @@ done
 서버를 실행한 상태에서 아래처럼 같은 호스트의 URL 두 개를 한 `curl` 명령으로 요청할 수 있습니다. `-v` 출력에서 연결 재사용 여부를 볼 수 있습니다.
 
 ```sh
-curl -v 'http://127.0.0.1:8080/' 'http://127.0.0.1:8080/cgi-bin/sum?a=3&b=5'
+curl -v 'http://127.0.0.1:9000/' 'http://127.0.0.1:9000/cgi-bin/sum?a=3&b=5'
 ```
 
 ### 동시성 모델과 논블로킹 고려 사항
@@ -283,10 +312,10 @@ curl -v 'http://127.0.0.1:8080/' 'http://127.0.0.1:8080/cgi-bin/sum?a=3&b=5'
 
 | 과제 항목 | 현재 상태 |
 | --- | --- |
-| TCP 소켓 서버 | `socket()` → `bind()` → `listen()` → `accept()` 구현. `127.0.0.1:8080`에서 실행합니다. |
+| TCP 소켓 서버 | `socket()` → `bind()` → `listen()` → `accept()` 구현. `127.0.0.1:9000`에서 실행합니다. |
 | HTTP 요청 파싱 | `GET`·`POST`, 요청 라인, 주요 헤더, `Content-Length` 기반 본문 처리를 구현했습니다. |
 | HTTP 응답 생성 | 상태 라인·헤더·본문 전송과 `100`, `3xx`, `403`·`404`·`500` 등의 응답 처리를 구현했습니다. HTTP `keep-alive`로 한 연결에서 여러 요청을 순서대로 처리합니다. |
 | 정적 파일 서빙 | `/static/`에서 파일을 제공하고, 확장자에 따라 MIME 타입을 설정합니다. |
-| 동적 요청 처리 | `GET /cgi-bin/sum?a=3&b=5`가 CGI 프로그램을 실행해 JSON을 반환합니다. `/api/`를 Flask로 전달하는 기능은 설계 단계입니다. |
+| 동적 요청 처리 | C 원 서버가 `GET /cgi-bin/sum?a=3&b=5`를 받아 CGI 프로그램을 실행하고 JSON을 반환합니다. |
 | 동시 요청 처리 | `kqueue`가 최대 64개 클라이언트 연결을 관리하고, `pthread` 워커 4개가 정적 파일을 읽습니다. |
-| 프록시 | 포워드 프록시는 `8081`에서 로컬 원 서버 `8080`으로 HTTP GET을 중계하며, 원 서버 연결 재사용과 정적 파일 응답 캐싱을 지원합니다. 리버스 프록시는 설계 단계입니다. |
+| 프록시 | 포워드 프록시는 HTTP GET 중계, 원 서버 연결 재사용, 정적 응답 캐싱을 지원합니다. 리버스 프록시는 두 C 원 서버에 Round-Robin으로 요청을 분산합니다. |

@@ -1,0 +1,37 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  padding: 2rem 1rem;
+  display: grid;
+  place-items: center;
+  background: #eff6f2;
+  color: #172b22;
+  font-family: system-ui, sans-serif;
+  line-height: 1.6;
+}
+
+main {
+  width: min(100%, 38rem);
+  padding: clamp(1.5rem, 5vw, 3rem);
+  border: 1px solid #c8ded0;
+  border-radius: 1rem;
+  background: #fff;
+  text-align: center;
+}
+
+h1 {
+  margin: 0 0 1rem;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  line-height: 1.25;
+}
+
+code {
+  padding: 0.1em 0.3em;
+  border-radius: 0.25rem;
+  background: #e7f1eb;
+  color: #214d39;
+}

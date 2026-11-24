@@ -29,7 +29,7 @@ static bool valid_header_name(const char *name, const char *colon)
     return colon != name && strspn(name, token_chars) == (size_t)(colon - name);
 }
 
-static bool connection_option(const char *options, const char *name, size_t name_length)
+bool proxy_connection_option(const char *options, const char *name, size_t name_length)
 {
     while (options != NULL && *options != '\0') {
         const char *next = strchr(options, ',');
@@ -47,6 +47,29 @@ static bool connection_option(const char *options, const char *name, size_t name
         options = next == NULL ? NULL : next + 1;
     }
     return false;
+}
+
+enum proxy_header_result proxy_read_headers(char *headers, size_t *header_length,
+                                           const char *bytes, size_t length, size_t *consumed)
+{
+    *consumed = 0;
+    while (*consumed < length) {
+        size_t count = *header_length;
+        char byte = bytes[(*consumed)++];
+        char previous = count == 0 ? '\0' : headers[count - 1];
+        if (count == HTTP_MAX_HEADERS || byte == '\x7f' ||
+            ((unsigned char)byte < 0x20 && byte != '\t' && byte != '\r' && byte != '\n') ||
+            (byte == '\n' && previous != '\r') || (previous == '\r' && byte != '\n')) {
+            return PROXY_HEADERS_INVALID;
+        }
+        headers[count++] = byte;
+        *header_length = count;
+        if (count >= 4 && memcmp(headers + count - 4, "\r\n\r\n", 4) == 0) {
+            headers[count] = '\0';
+            return PROXY_HEADERS_READY;
+        }
+    }
+    return PROXY_HEADERS_MORE;
 }
 
 static bool parse_length(const char *value, uintmax_t *length)
@@ -211,7 +234,7 @@ bool proxy_parse_response(char *raw_headers, bool client_keep_alive, time_t cach
             cache_blocked = true;
         }
     }
-    if (line == NULL || connection_option(options, "Content-Length", sizeof("Content-Length") - 1)) {
+    if (line == NULL || proxy_connection_option(options, "Content-Length", sizeof("Content-Length") - 1)) {
         return false;
     }
     if (no_body) {
@@ -220,8 +243,8 @@ bool proxy_parse_response(char *raw_headers, bool client_keep_alive, time_t cach
     }
     response->client_keep_alive = response->has_length && client_keep_alive;
     response->origin_keep_alive = response->has_length &&
-        !connection_option(options, "close", sizeof("close") - 1) &&
-        (implicit_keep_alive || connection_option(options, "keep-alive", sizeof("keep-alive") - 1));
+        !proxy_connection_option(options, "close", sizeof("close") - 1) &&
+        (implicit_keep_alive || proxy_connection_option(options, "keep-alive", sizeof("keep-alive") - 1));
 
     if (!append_header(response, status)) {
         return false;
@@ -232,7 +255,7 @@ bool proxy_parse_response(char *raw_headers, bool client_keep_alive, time_t cach
             named(line, name_length, "Proxy-Connection") ||
             named(line, name_length, "TE") || named(line, name_length, "Trailer") ||
             named(line, name_length, "Upgrade") ||
-            connection_option(options, line, name_length)) {
+            proxy_connection_option(options, line, name_length)) {
             continue;
         }
         if (!append_header(response, line)) {
@@ -240,8 +263,8 @@ bool proxy_parse_response(char *raw_headers, bool client_keep_alive, time_t cach
         }
     }
     if (!cache_blocked && response->has_length &&
-        !connection_option(options, "cache-control", sizeof("cache-control") - 1) &&
-        !connection_option(options, "date", sizeof("date") - 1)) {
+        !proxy_connection_option(options, "cache-control", sizeof("cache-control") - 1) &&
+        !proxy_connection_option(options, "date", sizeof("date") - 1)) {
         prepare_cache_headers(response, cache_control, date, cache_request_at);
     }
     const char *connection = response->client_keep_alive ? "Connection: keep-alive"

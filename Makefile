@@ -11,7 +11,7 @@ tcp_server: tcp_server.c http.c http.h file_pool.c file_pool.h cgi.c cgi.h | cgi
 tcp_server_forward: tcp_server_forward.c proxy_cache.c proxy_cache.h proxy_response.c proxy_response.h http.c http.h file_pool.c file_pool.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-tcp_server_reverse: tcp_server_reverse.c http.c http.h
+tcp_server_reverse: tcp_server_reverse.c proxy_response.c proxy_response.h http.c http.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 cgi_sum: cgi_sum.c

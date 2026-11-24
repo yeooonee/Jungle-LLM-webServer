@@ -217,9 +217,14 @@ static bool dispatch_request(int queue, struct http_connection *state,
         return prepare_response(state, length, 405);
     }
 
+    struct sockaddr_in local_address = {0};
+    socklen_t address_length = sizeof(local_address);
+    if (getsockname(state->fd, (struct sockaddr *)&local_address, &address_length) == -1) {
+        return queue_response(state, pool, 500);
+    }
     const char *query = strchr(path, '?');
     struct cgi_process *cgi = cgi_start_sum(query == NULL ? "" : query + 1,
-                                           state->request.version);
+                                           state->request.version, ntohs(local_address.sin_port));
     if (cgi == NULL) {
         return queue_response(state, pool, 500);
     }
@@ -759,8 +764,20 @@ close_connections:
 
 int main(int argc, char *argv[])
 {
-    if (argc > 2) {
-        fprintf(stderr, "Usage: %s [static-root]\n", argv[0]);
+    int port = 9000;
+    int option;
+    while ((option = getopt(argc, argv, "p:")) == 'p') {
+        char *end;
+        long requested = strtol(optarg, &end, 10);
+        if (*optarg < '0' || *optarg > '9' || *end != '\0' ||
+            requested < 1 || requested > UINT16_MAX) {
+            fputs("Port must be an integer between 1 and 65535\n", stderr);
+            return 1;
+        }
+        port = (int)requested;
+    }
+    if (option != -1 || argc - optind > 1) {
+        fprintf(stderr, "Usage: %s [-p port] [static-root]\n", argv[0]);
         return 1;
     }
 
@@ -790,7 +807,7 @@ int main(int argc, char *argv[])
 
     struct sockaddr_in address = {0};
     address.sin_family = AF_INET;
-    address.sin_port = htons(8080);
+    address.sin_port = htons(port);
     if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
         fputs("Invalid IPv4 address\n", stderr);
         close(server_fd);
@@ -810,10 +827,11 @@ int main(int argc, char *argv[])
 
     int root_fd = -1;
     struct file_pool *pool = NULL;
-    if (argc == 2) {
-        root_fd = open(argv[1], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (optind < argc) {
+        const char *root = argv[optind];
+        root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (root_fd == -1) {
-            perror(argv[1]);
+            perror(root);
             close(server_fd);
             return 1;
         }
@@ -826,7 +844,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    puts("HTTP server listening on http://127.0.0.1:8080");
+    printf("HTTP server listening on http://127.0.0.1:%d\n", port);
 
     int result = run_server(server_fd, pool);
     if (pool != NULL) {

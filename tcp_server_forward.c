@@ -17,8 +17,8 @@
 #include <unistd.h>
 
 enum {
-    LISTEN_PORT = 8081,
-    ORIGIN_PORT = 8080,
+    LISTEN_PORT = 9100,
+    DEFAULT_ORIGIN_PORT = 9000,
     MAX_CLIENTS = 64,
     MAX_EVENTS = MAX_CLIENTS * 3 + 4,
     BUFFER_SIZE = 4096,
@@ -27,6 +27,7 @@ enum {
 };
 #define HELLO_ETAG "\"hello-v1\""
 #define STATIC_PREFIX "/static/"
+#define STATIC_INDEX STATIC_PREFIX "index.html"
 #define ORIGIN_ADDRESS "127.0.0.1"
 
 struct upstream_connection {
@@ -49,6 +50,7 @@ struct upstream_connection {
 struct http_connection {
     int fd;
     int slot;
+    int origin_port;
     uint64_t connection_id;
     short filter;
     char input[BUFFER_SIZE];
@@ -204,6 +206,12 @@ static bool request_path_is(const char *path, const char *expected)
     return strlen(expected) == length && memcmp(path, expected, length) == 0;
 }
 
+static bool is_offloaded_asset(const char *path)
+{
+    return request_path_is(path, STATIC_PREFIX "logo.png") ||
+           request_path_is(path, STATIC_PREFIX "style.css");
+}
+
 static bool prepare_response(struct http_connection *state, int length, int status)
 {
     if (length < 0 || (size_t)length >= sizeof(state->response)) {
@@ -215,22 +223,26 @@ static bool prepare_response(struct http_connection *state, int length, int stat
     return true;
 }
 
+static int submit_static_file(struct http_connection *state, struct file_pool *pool, const char *path)
+{
+    if (pool == NULL) {
+        return 404;
+    }
+    int status = file_pool_submit_open(pool, state->slot, state->connection_id,
+                                       path + sizeof(STATIC_PREFIX) - 1);
+    state->file_pending = status == 0;
+    return status;
+}
+
 static bool queue_response(struct http_connection *state, struct file_pool *pool, int status)
 {
     const char *body = "";
     const char *extra_headers = "";
     if (status == 200 && strcmp(state->request.method, "GET") == 0) {
         const char *path = request_path(state->request.uri);
-        size_t prefix_length = sizeof(STATIC_PREFIX) - 1;
-        if (strncmp(path, STATIC_PREFIX, prefix_length) == 0) {
-            if (pool == NULL) {
-                status = 404;
-            } else {
-                status = file_pool_submit_open(pool, state->slot, state->connection_id,
-                                               path + prefix_length);
-            }
+        if (strncmp(path, STATIC_PREFIX, sizeof(STATIC_PREFIX) - 1) == 0) {
+            status = is_offloaded_asset(path) ? submit_static_file(state, pool, path) : 404;
             if (status == 0) {
-                state->file_pending = true;
                 return true;
             }
         } else if (request_path_is(path, "/redirect/permanent")) {
@@ -306,11 +318,11 @@ static bool origin_socket_is_idle(int fd)
     return received == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
-static int open_origin(struct upstream_connection *upstream)
+static int open_origin(struct upstream_connection *upstream, int port)
 {
     struct sockaddr_in origin = {0};
     origin.sin_family = AF_INET;
-    origin.sin_port = htons(ORIGIN_PORT);
+    origin.sin_port = htons(port);
     if (inet_pton(AF_INET, ORIGIN_ADDRESS, &origin.sin_addr) != 1) {
         return 500;
     }
@@ -355,7 +367,7 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
         return queue_response(state, pool, 400);
     }
     char authority[sizeof("127.0.0.1:65535")];
-    snprintf(authority, sizeof(authority), "%s:%d", ORIGIN_ADDRESS, ORIGIN_PORT);
+    snprintf(authority, sizeof(authority), "%s:%d", ORIGIN_ADDRESS, state->origin_port);
     const char *host = uri + sizeof("http://") - 1;
     size_t host_length = strcspn(host, "/?");
     if (host_length != strlen(authority) || memcmp(host, authority, host_length) != 0) {
@@ -367,14 +379,24 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
     if (getsockname(state->fd, (struct sockaddr *)&local, &local_length) == -1) {
         return queue_response(state, pool, 500);
     }
-    if (ntohs(local.sin_port) == ORIGIN_PORT) {
+    if (ntohs(local.sin_port) == state->origin_port) {
         return queue_response(state, pool, 403);
+    }
+
+    const char *path = host + host_length;
+    if (pool != NULL && is_offloaded_asset(path)) {
+        state->keep_alive = client_keep_alive;
+        int status = submit_static_file(state, pool, path);
+        return status == 0 || queue_response(state, pool, status);
     }
 
     if (!state->cache_checked) {
         state->cache_checked = true;
         state->cache_request_at = (time_t)-1;
-        if (!state->request.bypass_cache && strcmp(state->request.version, "HTTP/1.1") == 0) {
+        // Keep the HTML request on the origin path when static offloading is enabled.
+        bool index_from_origin = pool != NULL && request_path_is(path, STATIC_INDEX);
+        if (!index_from_origin && !state->request.bypass_cache &&
+            strcmp(state->request.version, "HTTP/1.1") == 0) {
             time_t now = proxy_cache_now();
             if (now >= 0) {
                 if (proxy_cache_lookup(uri, now, &state->cached)) {
@@ -398,7 +420,7 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
         }
         upstream->fd = -1;
         state->upstream = upstream;
-        int status = open_origin(upstream);
+        int status = open_origin(upstream, state->origin_port);
         if (status != 0) {
             close_upstream(queue, state);
             return queue_response(state, pool, status);
@@ -413,7 +435,6 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
     upstream->header_sent = 0;
     upstream->response = (struct proxy_response){0};
 
-    const char *path = host + host_length;
     const char *slash = *path == '/' ? "" : "/";
     int length = snprintf(upstream->request, sizeof(upstream->request),
                           "GET %s%s %s\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
@@ -679,7 +700,7 @@ static void close_client(int queue, struct http_connection *client, struct file_
 
 enum { ACCEPT_RETRY = -1, ACCEPT_FAILED = -2 };
 
-static int accept_client(int server_fd, struct http_connection clients[])
+static int accept_client(int server_fd, struct http_connection clients[], int origin_port)
 {
     int fd = accept(server_fd, NULL, NULL);
     if (fd == -1) {
@@ -708,6 +729,7 @@ static int accept_client(int server_fd, struct http_connection clients[])
     clients[slot] = (struct http_connection){
         .fd = fd,
         .slot = slot,
+        .origin_port = origin_port,
         .connection_id = clients[slot].connection_id + 1,
         .filter = EVFILT_READ,
     };
@@ -776,28 +798,19 @@ static bool buffer_upstream_response(struct http_connection *client, size_t rece
     struct upstream_connection *upstream = client->upstream;
     struct proxy_response *response = &upstream->response;
     if (response->header_length == 0) {
-        size_t consumed = 0;
-        while (consumed < received) {
-            size_t count = upstream->raw_header_length;
-            char byte = client->response[consumed++];
-            char previous = count == 0 ? '\0' : upstream->raw_headers[count - 1];
-            if (count == HTTP_MAX_HEADERS || byte == '\x7f' ||
-                ((unsigned char)byte < 0x20 && byte != '\t' && byte != '\r' && byte != '\n') ||
-                (byte == '\n' && previous != '\r') || (previous == '\r' && byte != '\n')) {
+        size_t consumed;
+        enum proxy_header_result result = proxy_read_headers(upstream->raw_headers,
+            &upstream->raw_header_length, client->response, received, &consumed);
+        if (result == PROXY_HEADERS_INVALID) {
+            return false;
+        }
+        if (result == PROXY_HEADERS_READY) {
+            if (!proxy_parse_response(upstream->raw_headers, client->keep_alive,
+                                      client->cache_request_at, response)) {
                 return false;
             }
-            upstream->raw_headers[count++] = byte;
-            upstream->raw_header_length = count;
-            if (count >= 4 && memcmp(upstream->raw_headers + count - 4, "\r\n\r\n", 4) == 0) {
-                upstream->raw_headers[count] = '\0';
-                if (!proxy_parse_response(upstream->raw_headers, client->keep_alive,
-                                          client->cache_request_at, response)) {
-                    return false;
-                }
-                client->keep_alive = response->client_keep_alive;
-                upstream->cache_capture = proxy_cache_begin(client->request.uri, response);
-                break;
-            }
+            client->keep_alive = response->client_keep_alive;
+            upstream->cache_capture = proxy_cache_begin(client->request.uri, response);
         }
         received -= consumed;
         memmove(client->response, client->response + consumed, received);
@@ -926,7 +939,7 @@ static bool service_file_completions(int queue, struct file_pool *pool,
     return true;
 }
 
-static int run_server(int server_fd, struct file_pool *pool)
+static int run_server(int server_fd, struct file_pool *pool, int origin_port)
 {
     int queue = kqueue();
     if (queue == -1) {
@@ -1040,7 +1053,7 @@ static int run_server(int server_fd, struct file_pool *pool)
             break;
         }
 
-        int slot = accept_client(server_fd, clients);
+        int slot = accept_client(server_fd, clients, origin_port);
         if (slot == ACCEPT_FAILED) {
             break;
         }
@@ -1064,8 +1077,9 @@ close_connections:
 int main(int argc, char *argv[])
 {
     int port = LISTEN_PORT;
+    int origin_port = DEFAULT_ORIGIN_PORT;
     int option;
-    while ((option = getopt(argc, argv, "p:")) == 'p') {
+    while ((option = getopt(argc, argv, "p:o:")) == 'p' || option == 'o') {
         char *end;
         long requested = strtol(optarg, &end, 10);
         if (*optarg < '0' || *optarg > '9' || *end != '\0' ||
@@ -1073,10 +1087,14 @@ int main(int argc, char *argv[])
             fputs("Port must be an integer between 1 and 65535\n", stderr);
             return 1;
         }
-        port = (int)requested;
+        if (option == 'p') {
+            port = (int)requested;
+        } else {
+            origin_port = (int)requested;
+        }
     }
     if (option != -1 || argc - optind > 1) {
-        fprintf(stderr, "Usage: %s [-p port] [static-root]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-p port] [-o destination-port] [static-root]\n", argv[0]);
         return 1;
     }
 
@@ -1145,7 +1163,7 @@ int main(int argc, char *argv[])
 
     printf("HTTP server listening on http://127.0.0.1:%d\n", port);
 
-    int result = run_server(server_fd, pool);
+    int result = run_server(server_fd, pool, origin_port);
     if (pool != NULL) {
         file_pool_destroy(pool);
         close(root_fd);

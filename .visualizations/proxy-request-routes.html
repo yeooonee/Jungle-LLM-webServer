@@ -1,0 +1,117 @@
+<section id="proxy-request-routes" aria-label="포워드 프록시의 요청 및 응답 경로">
+  <style>
+    #proxy-request-routes .route-files {
+      display: flex;
+      flex-wrap: wrap;
+      gap: calc(var(--font-size-base) * .4) calc(var(--font-size-base) * .65);
+      margin-block: calc(var(--font-size-base) * 1.25) calc(var(--font-size-base) * .85);
+    }
+
+    #proxy-request-routes .route-flow {
+      display: flex;
+      align-items: flex-start;
+      gap: calc(var(--font-size-base) * .7);
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+
+    #proxy-request-routes .route-stage {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      align-items: flex-start;
+      min-width: 0;
+      gap: calc(var(--font-size-base) * .25);
+    }
+
+    #proxy-request-routes .route-stage strong {
+      font-weight: 500;
+      color: var(--foreground);
+    }
+
+    #proxy-request-routes .route-connector {
+      display: grid;
+      justify-items: center;
+      color: var(--muted-foreground);
+    }
+
+    #proxy-request-routes .route-to,
+    #proxy-request-routes .route-request {
+      color: var(--viz-series-1, var(--foreground));
+    }
+
+    #proxy-request-routes .route-to::before { content: '→'; }
+    #proxy-request-routes .route-from::before { content: '←'; }
+
+    #proxy-request-routes .route-key {
+      display: flex;
+      flex-wrap: wrap;
+      gap: calc(var(--font-size-base) * 1);
+      margin-block-start: calc(var(--font-size-base) * .85);
+    }
+
+    @media (max-width: 520px) {
+      #proxy-request-routes .route-flow {
+        flex-direction: column;
+        gap: calc(var(--font-size-base) * .4);
+      }
+
+      #proxy-request-routes .route-connector {
+        grid-auto-flow: column;
+        gap: calc(var(--font-size-base) * .55);
+      }
+
+      #proxy-request-routes .route-to::before { content: '↓'; }
+      #proxy-request-routes .route-from::before { content: '↑'; }
+    }
+  </style>
+
+  <div class="nav nav-pills" role="tablist" aria-label="요청 종류">
+    <button class="nav-link active" type="button" role="tab" id="routes-local-tab"
+      aria-controls="routes-local-panel" aria-selected="true">로고 · CSS</button>
+    <button class="nav-link" type="button" role="tab" id="routes-origin-tab"
+      aria-controls="routes-origin-panel" aria-selected="false">HTML · CGI</button>
+  </div>
+
+  <div role="tabpanel" id="routes-local-panel" aria-labelledby="routes-local-tab">
+    <div class="route-files">
+      <code>/static/logo.png</code>
+      <code>/static/style.css</code>
+    </div>
+    <ol class="route-flow" aria-label="클라이언트와 포워드 프록시 사이의 요청과 응답">
+      <li class="route-stage"><strong>클라이언트</strong></li>
+      <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
+      <li class="route-stage">
+        <strong>포워드 프록시</strong>
+        <code>9100</code>
+        <span class="text-small text-muted"><code>./public</code>에서 읽어 응답</span>
+      </li>
+    </ol>
+  </div>
+
+  <div role="tabpanel" id="routes-origin-panel" aria-labelledby="routes-origin-tab" hidden>
+    <div class="route-files">
+      <code>/static/index.html</code>
+      <code>/cgi-bin/sum</code>
+    </div>
+    <ol class="route-flow" aria-label="클라이언트에서 포워드와 리버스 프록시를 거쳐 C 원 서버 한 대까지">
+      <li class="route-stage"><strong>클라이언트</strong></li>
+      <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
+      <li class="route-stage"><strong>포워드 프록시</strong><code>9100</code></li>
+      <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
+      <li class="route-stage">
+        <strong>리버스 프록시</strong>
+        <code>9200</code>
+        <span class="text-small text-muted">Round-Robin</span>
+      </li>
+      <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
+      <li class="route-stage"><strong>C 원 서버</strong><span><code>9000</code> 또는 <code>9001</code></span></li>
+    </ol>
+  </div>
+
+  <div class="route-key text-small text-muted" aria-hidden="true">
+    <span><span class="route-to"></span> <span class="route-request">요청</span></span>
+    <span><span class="route-from"></span> 응답</span>
+  </div>
+</section>

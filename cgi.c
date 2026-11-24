@@ -9,21 +9,24 @@
 #include <string.h>
 #include <unistd.h>
 
-struct cgi_process *cgi_start_sum(const char *query, const char *version)
+struct cgi_process *cgi_start_sum(const char *query, const char *version, unsigned int server_port)
 {
     char query_string[HTTP_MAX_HEADERS + sizeof("QUERY_STRING=")];
     char protocol[32];
+    char port[sizeof("SERVER_PORT=65535")];
     int query_length = snprintf(query_string, sizeof(query_string), "QUERY_STRING=%s", query);
     int protocol_length = snprintf(protocol, sizeof(protocol), "SERVER_PROTOCOL=%s", version);
+    int port_length = snprintf(port, sizeof(port), "SERVER_PORT=%u", server_port);
     if (query_length < 0 || (size_t)query_length >= sizeof(query_string) ||
-        protocol_length < 0 || (size_t)protocol_length >= sizeof(protocol)) {
+        protocol_length < 0 || (size_t)protocol_length >= sizeof(protocol) ||
+        port_length < 0 || (size_t)port_length >= sizeof(port)) {
         return NULL;
     }
     char *arguments[] = {"./cgi_sum", NULL};
     char *environment[] = {
         "GATEWAY_INTERFACE=CGI/1.1", "REQUEST_METHOD=GET", "SCRIPT_NAME=/cgi-bin/sum",
-        "SERVER_NAME=127.0.0.1", "SERVER_PORT=8080", "SERVER_SOFTWARE=Jungle-LLM-webServer",
-        protocol, query_string, NULL,
+        "SERVER_NAME=127.0.0.1", "SERVER_SOFTWARE=Jungle-LLM-webServer",
+        protocol, port, query_string, NULL,
     };
 
     struct cgi_process *cgi = calloc(1, sizeof(*cgi));

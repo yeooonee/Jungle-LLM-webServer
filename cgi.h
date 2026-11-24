@@ -15,7 +15,7 @@ struct cgi_process {
     char output[CGI_OUTPUT_LIMIT + 1];
 };
 
-struct cgi_process *cgi_start_sum(const char *query, const char *version);
+struct cgi_process *cgi_start_sum(const char *query, const char *version, unsigned int server_port);
 // Returns 1 after EOF, 0 while waiting for more output, or -1 on error.
 int cgi_read_output(struct cgi_process *cgi);
 int cgi_write_response(const struct cgi_process *cgi, char *response, size_t capacity,
