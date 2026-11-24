@@ -1,6 +1,7 @@
 // 스레드 풀: 메인 루프(생산자)가 연결 fd를 큐에 넣고, 워커(소비자)가 꺼내 처리
 // 큐는 원형 배열. 여러 스레드가 같이 만지니 mutex로 한 번에 한 스레드만,
 // 비었거나 꽉 찼을 때는 조건 변수로 재워서 바쁜 대기(계속 확인하며 CPU 낭비)를 막음
+#include <assert.h>
 #include <pthread.h>
 #include <stdlib.h>
 
@@ -19,6 +20,7 @@ static void *worker(void *arg) {
         pthread_mutex_lock(&lock);
         while (count == 0)                            // while: 깨어나도 다른 워커가 먼저 가져갔을 수 있음
             pthread_cond_wait(&not_empty, &lock);     // 잠그개를 풀고 잠듦 → 깨면 다시 잠그고 돌아옴
+        assert(count > 0);                            // 빈 큐에서 꺼내면 즉시 멈춤 (while을 if로 바꾸는 실수를 잡음. 깨뜨려 보기 B에서 확인)
         int fd = queue[head];
         head = (head + 1) % cap;
         count--;
