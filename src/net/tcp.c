@@ -2,6 +2,7 @@
 #include "dispatch.h"
 
 #include "dynamic/add.h"
+#include "cgi/send.h"
 #include "http/request.h"
 #include "http/response.h"
 #include "static/file.h"
@@ -42,7 +43,8 @@ int tcp_send_all(int socket_fd, const void *data, size_t length,
   return 0;
 }
 
-int tcp_handle_client(int client_fd, int root_fd,
+int tcp_handle_client(int client_fd, int root_fd, const char *cgi_program,
+                       int cancel_fd,
                          const volatile sig_atomic_t *stopping) {
   struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
   if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
@@ -81,6 +83,12 @@ int tcp_handle_client(int client_fd, int root_fd,
                memcmp(request.target.data, "/add", 4) == 0) {
       /* `POST /add`의 경우에만 동적 처리로 넘김 */
       result = dynamic_add_send(client_fd, request.body, stopping);
+    } else if (parsed == HTTP_PARSE_COMPLETE && cgi_program != NULL &&
+               request.method.length == 4 &&
+               memcmp(request.method.data, "POST", 4) == 0 &&
+               request.target.length == 8 &&
+               memcmp(request.target.data, "/cgi/add", 8) == 0) {
+      result = cgi_program_send(client_fd, cgi_program, request.body, stopping, cancel_fd);
     } else {
       int status = 400;
       const char *body = "Bad Request\n";
@@ -103,7 +111,7 @@ int tcp_handle_client(int client_fd, int root_fd,
   return result;
 }
 
-int tcp_http_server(unsigned short port, const char *root,
+int tcp_http_server(unsigned short port, const char *root, const char *cgi_program,
                     const volatile sig_atomic_t *stopping) {
   int root_fd = open(root, O_RDONLY | O_DIRECTORY);
   if (root_fd == -1) {
@@ -151,7 +159,7 @@ int tcp_http_server(unsigned short port, const char *root,
     goto cleanup;
   }
 
-  if (dispatch_start(root_fd, stopping) == -1) {
+  if (dispatch_start(root_fd, cgi_program, stopping) == -1) {
     perror("dispatch_start");
     goto cleanup;
   }

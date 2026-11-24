@@ -21,12 +21,14 @@ static struct {
   size_t count;                          /* 빈 큐, 가득 찬 큐를 구분 */
   size_t started;
   int root_fd;
+  const char *cgi_program;
+  int cancel_pipe[2];
   int stopping;
 } pool;
 
 static void *worker(void *argument) {
   struct worker_state *worker = argument;
-  /* 공유 종료 플래그 대신 dispatch_stop의 shutdown으로 블로킹 I/O를 깨운다. */
+  /* 소켓은 shutdown, CGI 대기는 취소 파이프로 깨워 공유 종료 플래그를 피한다. */
   const volatile sig_atomic_t not_stopping = 0;
   for (;;) {
     pthread_mutex_lock(&pool.mutex);
@@ -43,7 +45,8 @@ static void *worker(void *argument) {
     worker->client_fd = client_fd;
     pthread_mutex_unlock(&pool.mutex);
 
-    int result = tcp_handle_client(client_fd, pool.root_fd, &not_stopping);
+    int result = tcp_handle_client(client_fd, pool.root_fd, pool.cgi_program,
+                                     pool.cancel_pipe[0], &not_stopping);
     int error = errno;
     pthread_mutex_lock(&pool.mutex);
     int report_error = result == -1 && !pool.stopping;
@@ -75,6 +78,8 @@ void dispatch_client(int client_fd) {
 void dispatch_stop(void) {
   pthread_mutex_lock(&pool.mutex);
   pool.stopping = 1;
+  /* 읽기 끝은 모든 작업자가 공유하며 쓰기 끝을 닫으면 모두 EOF/HUP을 본다. */
+  close(pool.cancel_pipe[1]);
   while (pool.count > 0) {
     close(pool.queue[pool.head]);
     pool.head = (pool.head + 1) % THREAD_POOL_QUEUE_CAPACITY;
@@ -90,17 +95,20 @@ void dispatch_stop(void) {
   for (size_t i = 0; i < pool.started; ++i) {
     pthread_join(pool.workers[i].thread, NULL);
   }
+  close(pool.cancel_pipe[0]);
   pthread_cond_destroy(&pool.available);
   pthread_mutex_destroy(&pool.mutex);
 }
 
-int dispatch_start(int root_fd, const volatile sig_atomic_t *stopping) {
+int dispatch_start(int root_fd, const char *cgi_program,
+                     const volatile sig_atomic_t *stopping) {
   (void)stopping;
   pool.head = 0;
   pool.count = 0;
   pool.started = 0;
   pool.stopping = 0;
   pool.root_fd = root_fd;
+  pool.cgi_program = cgi_program;
   for (size_t i = 0; i < THREAD_POOL_WORKERS; ++i) {
     pool.workers[i].client_fd = -1;
   }
@@ -116,6 +124,14 @@ int dispatch_start(int root_fd, const volatile sig_atomic_t *stopping) {
     return -1;
   }
 
+  if (pipe(pool.cancel_pipe) == -1) {
+    int saved_error = errno;
+    pthread_cond_destroy(&pool.available);
+    pthread_mutex_destroy(&pool.mutex);
+    errno = saved_error;
+    return -1;
+  }
+
   /* 작업자에게 마스크를 상속시켜 종료 시그널은 수락 스레드에서만 처리한다. */
   sigset_t signals;
   sigset_t original_mask;
@@ -124,6 +140,8 @@ int dispatch_start(int root_fd, const volatile sig_atomic_t *stopping) {
   sigaddset(&signals, SIGTERM);
   error = pthread_sigmask(SIG_BLOCK, &signals, &original_mask);
   if (error != 0) {
+    close(pool.cancel_pipe[0]);
+    close(pool.cancel_pipe[1]);
     pthread_cond_destroy(&pool.available);
     pthread_mutex_destroy(&pool.mutex);
     errno = error;

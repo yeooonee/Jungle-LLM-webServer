@@ -119,6 +119,8 @@ int main(void) {
   check_response(403, "Forbidden", "forbidden", 9);
   check_response(404, "Not Found", "not found", 9);
   check_response(500, "Internal Server Error", "error", 5);
+  check_response(502, "Bad Gateway", "bad gateway", 11);
+  check_response(504, "Gateway Timeout", "timeout", 7);
   check_response(200, "OK", NULL, 0);
   const char binary[] = {'a', '\0', '\xff', '\r', '\n'};
   check_response(200, "OK", binary, sizeof(binary));

@@ -21,6 +21,10 @@ static const char *reason_phrase(int status) {
     return "Content Too Large";
   case 501:
     return "Not Implemented";
+  case 502:
+    return "Bad Gateway";
+  case 504:
+    return "Gateway Timeout";
   case 500:
     return "Internal Server Error";
   default:
@@ -41,10 +45,9 @@ static int valid_content_type(const char *value) {
   return 1;
 }
 
-int http_response_send_headers(int client_fd, const http_response *response,
-                       const volatile sig_atomic_t *stopping) {
-  if (response == NULL || stopping == NULL ||
-      !valid_content_type(response->content_type)) {
+static int format_headers(const http_response *response, char *headers,
+                           size_t capacity) {
+  if (response == NULL || !valid_content_type(response->content_type)) {
     errno = EINVAL;
     return -1;
   }
@@ -53,14 +56,8 @@ int http_response_send_headers(int client_fd, const http_response *response,
     errno = EINVAL;
     return -1;
   }
-  if (*stopping) {
-    errno = ECANCELED;
-    return -1;
-  }
-
-  char headers[1024];
   /* shortcut: 연결당 응답 하나를 보내며, 연결 재사용 단계에서 정책을 확장한다. */
-  int length = snprintf(headers, sizeof(headers),
+  int length = snprintf(headers, capacity,
                         "HTTP/1.1 %d %s\r\n"
                         "Content-Type: %s\r\n"
                         "Content-Length: %zu\r\n"
@@ -71,8 +68,36 @@ int http_response_send_headers(int client_fd, const http_response *response,
     errno = EIO;
     return -1;
   }
-  if ((size_t)length >= sizeof(headers)) {
+  if ((size_t)length >= capacity) {
     errno = EMSGSIZE;
+    return -1;
+  }
+
+  return length;
+}
+
+int http_response_validate(const http_response *response) {
+  if (response == NULL || (response->body == NULL && response->body_length != 0)) {
+    errno = EINVAL;
+    return -1;
+  }
+  char headers[1024];
+  return format_headers(response, headers, sizeof(headers)) < 0 ? -1 : 0;
+}
+
+int http_response_send_headers(int client_fd, const http_response *response,
+                       const volatile sig_atomic_t *stopping) {
+  if (stopping == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  char headers[1024];
+  int length = format_headers(response, headers, sizeof(headers));
+  if (length < 0) {
+    return -1;
+  }
+  if (*stopping) {
+    errno = ECANCELED;
     return -1;
   }
 

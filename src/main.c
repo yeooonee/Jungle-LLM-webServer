@@ -14,8 +14,8 @@ static void request_stop(int signal_number) {
 
 int main(int argc, char *argv[]) {
   long port = 8080;
-  if (argc > 3) {
-    fprintf(stderr, "Usage: %s [port: 1-65535] [static-root]\n", argv[0]);
+  if (argc > 4) {
+    fprintf(stderr, "Usage: %s [port: 1-65535] [static-root] [cgi-program]\n", argv[0]);
     return EXIT_FAILURE;
   }
   if (argc >= 2) {
@@ -47,7 +47,12 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  const char *root = argc == 3 ? argv[2] : "www";
-  return tcp_http_server((unsigned short)port, root, &stopping) == 0
+  const char *root = argc >= 3 ? argv[2] : "www";
+  const char *cgi_program = argc == 4 ? argv[3] : NULL;
+  if (cgi_program != NULL && *cgi_program == '\0') {
+    fprintf(stderr, "CGI program path must not be empty\n");
+    return EXIT_FAILURE;
+  }
+  return tcp_http_server((unsigned short)port, root, cgi_program, &stopping) == 0
              ? EXIT_SUCCESS : EXIT_FAILURE;
 }

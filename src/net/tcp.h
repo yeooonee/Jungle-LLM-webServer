@@ -8,7 +8,7 @@
 int tcp_send_all(int socket_fd, const void *data, size_t length,
                  const volatile sig_atomic_t *stopping);
 
-int tcp_http_server(unsigned short port, const char *root,
+int tcp_http_server(unsigned short port, const char *root, const char *cgi_program,
                     const volatile sig_atomic_t *stopping);
 
 #endif

@@ -33,17 +33,21 @@ ifeq ($(BUILD_MODE),release)
   MODE_CFLAGS  := -O2 -DNDEBUG
   MODE_LDFLAGS :=
   TARGET       := $(OUTPUT_DIR)/webserver-release
+  CGI_TARGET   := $(OUTPUT_DIR)/cgi-add-release
 else ifeq ($(BUILD_MODE),asan)
   MODE_CFLAGS  := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
   MODE_LDFLAGS := -fsanitize=address,undefined
   TARGET       := $(OUTPUT_DIR)/webserver-asan
+  CGI_TARGET   := $(OUTPUT_DIR)/cgi-add-asan
 else
   MODE_CFLAGS  := -O0 -g
   MODE_LDFLAGS :=
   TARGET       := $(OUTPUT_DIR)/webserver
+  CGI_TARGET   := $(OUTPUT_DIR)/cgi-add
 endif
 
 OBJ_DIR  := $(OUTPUT_DIR)/obj-$(BUILD_MODE)
+CGI_LAUNCH_TARGET := $(subst cgi-add,cgi-launch,$(CGI_TARGET))
 OBJS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 DEPS     := $(OBJS:.o=.d)
 
@@ -51,7 +55,7 @@ CPPFLAGS := $(BASE_CPPFLAGS) $(PLATFORM_CPPFLAGS) $(EXTRA_CPPFLAGS)
 CFLAGS   := $(BASE_CFLAGS) $(MODE_CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS  := $(BASE_LDFLAGS) $(MODE_LDFLAGS) $(EXTRA_LDFLAGS)
 
-.PHONY: all debug release asan test test-integration clean help
+.PHONY: all debug release asan cgi test test-cgi test-integration clean help
 
 all: $(TARGET)
 
@@ -63,6 +67,20 @@ release:
 
 asan:
 	@$(MAKE) --no-print-directory BUILD_MODE=asan all
+
+cgi: $(CGI_TARGET) $(CGI_LAUNCH_TARGET)
+
+$(CGI_LAUNCH_TARGET): samples/cgi-launch.c src/cgi/run.c src/cgi/run.h src/cgi/response.c src/cgi/response.h src/http/request.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) samples/cgi-launch.c src/cgi/run.c src/cgi/response.c -o $@ $(LDFLAGS)
+
+$(CGI_TARGET): samples/cgi-add.c src/dynamic/add.c src/dynamic/add.h src/http/request.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) samples/cgi-add.c src/dynamic/add.c -o $@ $(LDFLAGS)
+
+test-cgi: $(CGI_TARGET) $(CGI_LAUNCH_TARGET)
+	python3 tests/integration/test_cgi_add.py $(CGI_TARGET)
+	python3 tests/integration/test_cgi_launch.py $(CGI_LAUNCH_TARGET) $(CGI_TARGET)
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
@@ -89,9 +107,10 @@ test:
 clean:
 	rm -rf $(BUILD_DIR)
 
-test-integration: $(TARGET)
+test-integration: $(TARGET) $(CGI_TARGET)
 	python3 tests/integration/test_static.py $(TARGET)
 	python3 tests/integration/test_concurrency.py $(TARGET) $(CONCURRENCY)
+	python3 tests/integration/test_cgi_http.py $(TARGET) $(CGI_TARGET) $(CONCURRENCY)
 
 help:
 	@echo "CONCURRENCY=threadpool (default) or sequential"
@@ -100,7 +119,9 @@ help:
 	@echo "  make release  Build optimized binary ($(OUTPUT_DIR)/webserver-release)"
 	@echo "  make asan     Build with ASan + UBSan ($(OUTPUT_DIR)/webserver-asan)"
 	@echo "  make test     Build and run unit tests in tests/unit/"
-	@echo "  make test-integration  Run static HTTP checks (Python 3 required)"
+	@echo "  make cgi      Build CGI program and learning launcher ($(CGI_TARGET))"
+	@echo "  make test-cgi Run standalone CGI checks (Python 3 required)"
+	@echo "  make test-integration  Run HTTP, concurrency and CGI checks (Python 3 required)"
 	@echo "  make clean    Remove build artifacts"
 
 -include $(DEPS)

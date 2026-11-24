@@ -11,6 +11,9 @@ typedef struct {
   size_t body_length;
 } http_response;
 
+/* 송신 없이 상태 코드·헤더·본문 포인터를 검증한다. 성공 0, 실패 -1과 errno. */
+int http_response_validate(const http_response *response);
+
 /* 파일처럼 본문을 별도로 전송할 때 사용한다. */
 int http_response_send_headers(int client_fd, const http_response *response,
                                const volatile sig_atomic_t *stopping);
