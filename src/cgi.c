@@ -1,6 +1,7 @@
 // 동적 처리 (CGI, RFC 3875): fork → (자식) dup2 + exec / (부모) 본문 쓰기 → 출력 모으기 → waitpid → 응답
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -91,7 +92,9 @@ static int send_cgi_response(int fd, char *out, size_t len) {
     char *pass = malloc(len * 2 + 1);
     if (!pass) return -1;
     size_t pl = 0;
-    for (char *line = strtok(out, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+    // strtok_r: 진행 위치를 함수 안 숨은 전역 대신 save에 둠 → 워커 여러 개가 동시에 불러도 안 섞임
+    char *save;
+    for (char *line = strtok_r(out, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
         char *colon = strchr(line, ':');
         if (!colon || colon == line) { free(pass); return -1; }   // "이름: 값" 형식이 아님
         char *value = colon + 1;
@@ -177,6 +180,12 @@ void serve_cgi(int fd, const char *method, const char *url_path,
         send_response(fd, 500, "Internal Server Error", "Internal Server Error");
         return;
     }
+    // 다른 워커가 동시에 fork한 CGI 자식에게도 이 파이프가 복사됨 → exec 때 닫히게.
+    // 안 그러면 남의 자식이 쓰는 끝(outp[1])을 쥐고 있어 우리 read가 그 자식이 끝날 때까지 EOF를 못 받음
+    // (내 자식은 dup2로 0·1번에 옮기는데, dup2는 이 표시를 지우므로 영향 없음)
+    // shortcut: pipe~fcntl 사이 틈은 그대로 (macOS엔 pipe2 없음) → 문제 되면 fork를 rwlock으로 감싸기
+    int ends[4] = { in[0], in[1], outp[0], outp[1] };
+    for (int i = 0; i < 4; i++) fcntl(ends[i], F_SETFD, FD_CLOEXEC);
 
     // 1. fork: 0이면 자식, 양수면 부모(값 = 자식 pid)
     pid_t pid = fork();

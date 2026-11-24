@@ -1,14 +1,45 @@
 // HTTP 층: 요청 읽기 → 파싱(요청 라인·헤더·본문) → 응답 고르기
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 #include "http.h"
 #include "cgi.h"
 #include "static.h"
+
+// 시작 때 1번 정하고 안 바뀜 → 워커들이 읽기만 해서 안전
+static int read_timeout_ms;      // read 한 번이 기다리는 최대 시간
+static int request_timeout_ms;   // 요청 전체(헤더+본문)를 다 받는 기한
+
+void http_init(int read_timeout_s, int request_timeout_s) {
+    read_timeout_ms = read_timeout_s * 1000;
+    request_timeout_ms = request_timeout_s * 1000;
+}
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);   // 벽시계가 아니라 계속 증가만 하는 시계 (시간 변경에 안 흔들림)
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+}
+
+// 기한 안에서 read 한 번. SO_RCVTIMEO = min(read 한 번 한도, 전체 기한까지 남은 시간)
+// → 1바이트씩 찔끔 보내는 손님(Slowloris)도 전체 기한에서 걸림. 시간 초과면 -2
+static ssize_t read_until(int fd, char *buf, size_t len, long deadline) {
+    long left = deadline - now_ms();
+    if (left <= 0) return -2;
+    if (left > read_timeout_ms) left = read_timeout_ms;
+    struct timeval tv = { .tv_sec = left / 1000, .tv_usec = (left % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ssize_t n = read(fd, buf, len);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return -2;   // 시간 안에 아무것도 안 옴
+    return n;
+}
 
 int write_all(int fd, const char *buf, size_t len) {
     for (size_t sent = 0; sent < len; ) {
@@ -43,14 +74,21 @@ void handle_client(int client_fd, const char *root) {
     char buf[8192];
     size_t total = 0;
     char *header_end = NULL;
+    long deadline = now_ms() + request_timeout_ms;            // 요청 전체 기한: 첫 read 전부터 잼
+    int timed_out = 0;
     while (!header_end && total < sizeof(buf) - 1) {
-        ssize_t n = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+        ssize_t n = read_until(client_fd, buf + total, sizeof(buf) - 1 - total, deadline);
+        if (n == -2) { timed_out = 1; break; }
         if (n <= 0) break;                                     // 0: 상대가 끊음, -1: 에러
         total += n;
         buf[total] = '\0';
         header_end = strstr(buf, "\r\n\r\n");
     }
-    if (total == 0) return;                                    // 아무것도 안 왔으면 응답 없이 close
+    if (total == 0) return;                                    // 아무것도 안 왔으면(시간 초과 포함) 응답 없이 close
+    if (timed_out) {                                           // 일부는 받았는데 기한 안에 다 안 옴
+        send_response(client_fd, 408, "Request Timeout", "Request Timeout");
+        return;
+    }
 
     // 파싱 ① 요청 라인: "GET /index.html HTTP/1.1" → 공백 기준 3조각
     char method[16], path[1024], version[16];
@@ -106,7 +144,11 @@ void handle_client(int client_fd, const char *root) {
         else if ((size_t)content_length > room) too_big = 1;
         else {
             while (have < (size_t)content_length) {
-                ssize_t n = read(client_fd, buf + total, content_length - have);
+                ssize_t n = read_until(client_fd, buf + total, content_length - have, deadline);
+                if (n == -2) {                                 // 본문이 기한 안에 다 안 옴 (Content-Length: 100에 10바이트)
+                    send_response(client_fd, 408, "Request Timeout", "Request Timeout");
+                    return;
+                }
                 if (n <= 0) break;
                 total += n;
                 have += n;

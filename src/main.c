@@ -1,4 +1,5 @@
-// 서버 뼈대: 실행 설정 → socket → bind → listen (1번) / accept → handle_client → close (반복)
+// 서버 뼈대: 실행 설정 → socket → bind → listen (1번) / accept → 작업 큐 (반복)
+// 워커 스레드가 큐에서 꺼내 handle_client → close
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -11,6 +12,7 @@
 
 #include "http.h"
 #include "cgi.h"
+#include "pool.h"
 #include "static.h"
 
 #define BACKLOG 10   // listen 대기열 길이
@@ -24,7 +26,12 @@ static struct {
     char cgi_timeout[16];
     char cgi_max_output[16];
     char cgi_log[PATH_MAX];
-} conf = { "8080", "./www", "./mime.types", "./build/cgi-bin", "5", "1048576", "./cgi.log" };
+    char workers[16];
+    char queue_size[16];
+    char read_timeout[16];
+    char request_timeout[16];
+} conf = { "8080", "./www", "./mime.types", "./build/cgi-bin", "5", "1048576", "./cgi.log",
+           "8", "16", "5", "10" };
 
 // 숫자 설정값 검사. strtol: end = 숫자 다음 글자 위치. "80abc"면 end가 'a'를 가리킴 → 거절
 static long to_long(const char *s, long min, long max, const char *name) {
@@ -54,6 +61,10 @@ static void load_config(const char *path) {
         else if (got == 2 && !strcmp(key, "cgi_timeout")) snprintf(conf.cgi_timeout, sizeof(conf.cgi_timeout), "%s", value);
         else if (got == 2 && !strcmp(key, "cgi_max_output")) snprintf(conf.cgi_max_output, sizeof(conf.cgi_max_output), "%s", value);
         else if (got == 2 && !strcmp(key, "cgi_log"))    snprintf(conf.cgi_log, sizeof(conf.cgi_log), "%s", value);
+        else if (got == 2 && !strcmp(key, "workers"))    snprintf(conf.workers, sizeof(conf.workers), "%s", value);
+        else if (got == 2 && !strcmp(key, "queue_size")) snprintf(conf.queue_size, sizeof(conf.queue_size), "%s", value);
+        else if (got == 2 && !strcmp(key, "read_timeout")) snprintf(conf.read_timeout, sizeof(conf.read_timeout), "%s", value);
+        else if (got == 2 && !strcmp(key, "request_timeout")) snprintf(conf.request_timeout, sizeof(conf.request_timeout), "%s", value);
         else { fprintf(stderr, "%s:%d: bad line\n", path, no); exit(1); }
     }
     fclose(f);
@@ -81,6 +92,13 @@ static int open_listen_socket(int port) {
     return server_fd;
 }
 
+// 워커가 큐에서 꺼낸 연결 하나를 처리. root는 시작 때 1번 정하고 안 바뀜 → 여러 스레드가 읽기만 해서 안전
+static char root[PATH_MAX];
+static void serve_connection(int client_fd) {
+    handle_client(client_fd, root);   // 5. read → 파싱 → write
+    close(client_fd);                 // 6. close: 하위 소켓만 닫음
+}
+
 int main(int argc, char **argv) {
     // 0. 실행 설정: ./server [-c 설정파일] [-p 포트] [-r 루트]
     //    설정 파일을 먼저 읽고, 그다음 -p/-r로 덮어씀 (getopt: POSIX 표준 옵션 파서)
@@ -101,8 +119,12 @@ int main(int argc, char **argv) {
     long port = to_long(conf.port, 1, 65535, "port");
     long cgi_timeout = to_long(conf.cgi_timeout, 1, 3600, "cgi_timeout");
     long cgi_max = to_long(conf.cgi_max_output, 1, 64L * 1024 * 1024, "cgi_max_output");
+    long workers = to_long(conf.workers, 1, 1024, "workers");
+    long queue_size = to_long(conf.queue_size, 1, 65536, "queue_size");
+    long read_timeout = to_long(conf.read_timeout, 1, 3600, "read_timeout");
+    long request_timeout = to_long(conf.request_timeout, 1, 3600, "request_timeout");
+    http_init((int)read_timeout, (int)request_timeout);
     // 루트는 서버 도는 동안 안 바뀜 → 시작할 때 1번 진짜 경로로 (없으면 포트 열기 전에 종료)
-    static char root[PATH_MAX];
     if (!realpath(conf.root, root)) { perror(conf.root); exit(1); }
     if (load_mime_types(conf.mime_types) < 0) { perror(conf.mime_types); exit(1); }
 
@@ -119,16 +141,18 @@ int main(int argc, char **argv) {
 
     int server_fd = open_listen_socket((int)port);
     fcntl(server_fd, F_SETFD, FD_CLOEXEC);   // exec된 CGI 프로그램에 메인 소켓이 따라가지 않게
-    printf("listening on http://localhost:%ld (root: %s)\n", port, root);
+    if (pool_start((int)workers, (int)queue_size, serve_connection) < 0) { perror("pool_start"); exit(1); }
+    printf("listening on http://localhost:%ld (root: %s, workers %ld, queue %ld)\n", port, root, workers, queue_size);
 
     while (1) {
         // 4. accept: 대기열에서 한 명 꺼내 하위 소켓 생성 (없으면 블로킹)
         int client_fd = accept(server_fd, NULL, NULL);
         if (client_fd < 0) { perror("accept"); continue; }
+        // 다른 워커가 CGI를 fork하면 이 소켓도 자식에게 복사됨 → exec 때 닫히게.
+        // 안 그러면 CGI가 끝날 때까지 손님이 연결 종료(EOF)를 못 받음
+        // shortcut: accept~fcntl 사이에 다른 스레드가 fork하면 새어 나감 (틈은 μs 단위) → 문제 되면 fork를 rwlock으로 감싸기
+        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
-        handle_client(client_fd, root);   // 5. read → 파싱 → write
-
-        // 6. close: 하위 소켓만 닫음 (메인 소켓은 계속 손님 받음)
-        close(client_fd);
+        pool_push(client_fd);   // 큐가 꽉 차면 여기서 기다림 → 그동안 accept 안 함
     }
 }

@@ -5,11 +5,11 @@ CGI_PROGS = $(patsubst cgi-src/%.c,build/cgi-bin/%,$(wildcard cgi-src/*.c))
 
 all: build/server build/server_copy $(CGI_PROGS)
 
-SRCS = src/main.c src/http.c src/static.c src/cgi.c
+SRCS = src/main.c src/http.c src/static.c src/cgi.c src/pool.c
 
-build/server: $(SRCS) src/http.h src/static.h src/cgi.h
+build/server: $(SRCS) src/http.h src/static.h src/cgi.h src/pool.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ $(SRCS)
+	$(CC) $(CFLAGS) -pthread -o $@ $(SRCS)
 
 # CGI 프로그램: cgi-src/이름.c → build/cgi-bin/이름 (server.conf의 cgi_root)
 build/cgi-bin/%: cgi-src/%.c

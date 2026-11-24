@@ -4,6 +4,9 @@
 
 #include <stddef.h>
 
+// 서버 시작 때 1번: 요청 읽기 타임아웃 (read 한 번 / 요청 전체, 초)
+void http_init(int read_timeout_s, int request_timeout_s);
+
 // 손님 한 명 처리: 요청 읽기 → 파싱 → 응답 (close는 호출한 쪽이 함)
 void handle_client(int fd, const char *root);
 
