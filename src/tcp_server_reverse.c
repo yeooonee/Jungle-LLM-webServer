@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -17,17 +18,58 @@
 
 enum {
     LISTEN_PORT = 9200,
+    DEFAULT_STATIC_PORT = 9000,
+    DEFAULT_CGI_PORT = 9001,
     MAX_BACKENDS = 16,
+    MAX_ROUTES = 16,
     MAX_CLIENTS = 64,
-    MAX_EVENTS = MAX_CLIENTS * 3 + 3,
+    MAX_EVENTS = MAX_CLIENTS * 3 + MAX_BACKENDS + 5,
     BUFFER_SIZE = 4096,
-    CLIENT_TIMEOUT_MS = 5000
+    ORIGIN_AUTH_HEADER_CAPACITY = sizeof(HTTP_ORIGIN_TOKEN_HEADER ": \r\n") + HTTP_ORIGIN_TOKEN_LENGTH,
+    CLIENT_TIMEOUT_MS = 5000,
+    HEALTH_CHECK_TIMEOUT_MS = 1000,
+    HEALTH_INTERVAL_TIMER = MAX_CLIENTS,
+    HEALTH_DEADLINE_TIMER
+};
+
+struct health_probe {
+    int fd;
+    short filter;
+    bool connecting;
+    char request[128 + ORIGIN_AUTH_HEADER_CAPACITY];
+    size_t request_length;
+    size_t request_sent;
+    char headers[HTTP_MAX_HEADERS + 1];
+    size_t header_length;
+};
+
+struct backend_target {
+    int port;
+    bool healthy;
+    struct health_probe probe;
+};
+
+struct backend_group {
+    size_t indices[MAX_BACKENDS];
+    size_t count;
+    size_t next;
+};
+
+struct proxy_route {
+    const char *path;
+    size_t path_length;
+    struct backend_group backends;
+    const struct backend_target *standby;
 };
 
 struct backend_pool {
-    int ports[MAX_BACKENDS];
+    struct backend_target targets[MAX_BACKENDS];
     size_t count;
-    size_t next;
+    struct backend_group fallback;
+    struct proxy_route routes[MAX_ROUTES];
+    size_t route_count;
+    int health_interval_ms;
+    char origin_auth_header[ORIGIN_AUTH_HEADER_CAPACITY];
 };
 
 struct backend_connection {
@@ -36,7 +78,7 @@ struct backend_connection {
     short filter;
     bool connecting;
     bool response_started;
-    char request_headers[HTTP_MAX_HEADERS + 128];
+    char request_headers[HTTP_MAX_HEADERS + 128 + ORIGIN_AUTH_HEADER_CAPACITY];
     size_t request_header_length;
     size_t request_sent;
     char raw_headers[HTTP_MAX_HEADERS + 1];
@@ -83,6 +125,35 @@ static int configure_socket(int fd)
         return -1;
     }
     return fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+static int connect_backend(int port, bool *connecting)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1) {
+        return -1;
+    }
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(port)};
+    if (configure_socket(fd) == -1 || inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+    *connecting = false;
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
+        if (errno != EINPROGRESS && errno != EINTR) {
+            close(fd);
+            return -1;
+        }
+        *connecting = true;
+    }
+    return fd;
+}
+
+static bool connection_ready(int fd)
+{
+    int error;
+    socklen_t length = sizeof(error);
+    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == 0;
 }
 
 // Return 0 while more bytes are needed, or an HTTP status when ready to reply.
@@ -145,18 +216,40 @@ static int read_request_bytes(struct http_connection *state, const char *data,
     return 0;
 }
 
-static int next_backend(struct backend_pool *pool)
+static struct proxy_route *find_route(struct backend_pool *pool, const char *path, size_t length)
 {
-    int port = pool->ports[pool->next];
-    pool->next = (pool->next + 1) % pool->count;
-    return port;
+    for (size_t i = 0; i < pool->route_count; i++) {
+        struct proxy_route *route = &pool->routes[i];
+        if (route->path_length == length && memcmp(route->path, path, length) == 0) {
+            return route;
+        }
+    }
+    return NULL;
+}
+
+static int next_backend(struct backend_pool *pool, const char *uri)
+{
+    struct proxy_route *route = find_route(pool, uri, strcspn(uri, "?"));
+    struct backend_group *group = route == NULL ? &pool->fallback : &route->backends;
+    for (size_t i = 0; i < group->count; i++) {
+        const struct backend_target *target = &pool->targets[group->indices[group->next]];
+        group->next = (group->next + 1) % group->count;
+        if (pool->health_interval_ms == 0 || target->healthy) {
+            return target->port;
+        }
+    }
+    if (route != NULL && route->standby != NULL && route->standby->healthy) {
+        return route->standby->port;
+    }
+    return 0;
 }
 
 static bool replaced_request_header(const char *name, size_t length)
 {
     static const char *const names[] = {
         "Host", "Connection", "Content-Length", "Expect", "Keep-Alive", "Proxy-Connection",
-        "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding", "Upgrade"
+        "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
+        HTTP_ORIGIN_TOKEN_HEADER
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (strlen(names[i]) == length && strncasecmp(name, names[i], length) == 0) {
@@ -173,9 +266,9 @@ static bool build_backend_request(const struct http_connection *client,
     char *output = backend->request_headers;
     size_t capacity = sizeof(backend->request_headers);
     int length = snprintf(output, capacity,
-                          "%s %s %s\r\nHost: 127.0.0.1:%d\r\nContent-Length: %zu\r\nConnection: close\r\n",
+                          "%s %s %s\r\nHost: 127.0.0.1:%d\r\nContent-Length: %zu\r\nConnection: close\r\n%s",
                           request->method, request->uri, request->version, backend->port,
-                          request->content_length);
+                          request->content_length, client->origins->origin_auth_header);
     if (length < 0 || (size_t)length >= capacity) {
         return false;
     }
@@ -259,36 +352,27 @@ static void close_backend(struct http_connection *client)
 
 static bool start_backend(int queue, struct http_connection *client)
 {
+    int port = next_backend(client->origins, client->request.uri);
+    if (port == 0) {
+        return queue_response(client, 503);
+    }
     struct backend_connection *backend = calloc(1, sizeof(*backend));
     if (backend == NULL) {
         return queue_response(client, 500);
     }
-    backend->port = next_backend(client->origins);
+    backend->port = port;
     if (!build_backend_request(client, backend)) {
         free(backend);
         return queue_response(client, 500);
     }
 
-    backend->fd = socket(AF_INET, SOCK_STREAM, 0);
+    backend->fd = connect_backend(backend->port, &backend->connecting);
     if (backend->fd == -1) {
         free(backend);
         return queue_response(client, 502);
     }
     client->backend = backend;
 
-    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(backend->port)};
-    if (configure_socket(backend->fd) == -1 ||
-        inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1) {
-        close_backend(client);
-        return queue_response(client, 502);
-    }
-    if (connect(backend->fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
-        if (errno != EINPROGRESS && errno != EINTR) {
-            close_backend(client);
-            return queue_response(client, 502);
-        }
-        backend->connecting = true;
-    }
     if (!set_backend_filter(queue, client, EVFILT_WRITE) || !arm_timeout(queue, client)) {
         close_backend(client);
         return queue_response(client, 500);
@@ -502,7 +586,7 @@ static int watch_read(int queue, int fd, struct http_connection *client)
     return kevent(queue, &change, 1, NULL, 0, NULL);
 }
 
-static bool set_socket_filter(int queue, struct http_connection *client, int fd,
+static bool set_socket_filter(int queue, void *event_data, int fd,
                               short *filter, short next_filter)
 {
     if (*filter == next_filter) {
@@ -515,7 +599,7 @@ static bool set_socket_filter(int queue, struct http_connection *client, int fd,
         count++;
     }
     if (next_filter != 0) {
-        EV_SET(&changes[count], (uintptr_t)fd, next_filter, EV_ADD, 0, 0, client);
+        EV_SET(&changes[count], (uintptr_t)fd, next_filter, EV_ADD, 0, 0, event_data);
         count++;
     }
     if (kevent(queue, changes, count, NULL, 0, NULL) == -1) {
@@ -537,6 +621,119 @@ static bool set_backend_filter(int queue, struct http_connection *client, short 
     return set_socket_filter(queue, client, backend->fd, &backend->filter, next);
 }
 
+static void finish_health_probe(struct backend_target *target, bool healthy)
+{
+    close(target->probe.fd);
+    target->probe.fd = -1;
+    target->healthy = healthy;
+}
+
+static void expire_health_probes(struct backend_pool *pool)
+{
+    for (size_t i = 0; i < pool->count; i++) {
+        if (pool->targets[i].probe.fd != -1) {
+            finish_health_probe(&pool->targets[i], false);
+        }
+    }
+}
+
+static bool watch_health_timer(int queue, uintptr_t ident, int milliseconds, unsigned short flags)
+{
+    struct kevent change;
+    EV_SET(&change, ident, EVFILT_TIMER, EV_ADD | flags, 0, milliseconds, NULL);
+    if (kevent(queue, &change, 1, NULL, 0, NULL) == -1) {
+        perror("kevent: watch health check timer");
+        return false;
+    }
+    return true;
+}
+
+static bool start_health_probes(int queue, struct backend_pool *pool)
+{
+    expire_health_probes(pool);
+    bool pending = false;
+    for (size_t i = 0; i < pool->count; i++) {
+        struct backend_target *target = &pool->targets[i];
+        struct health_probe *probe = &target->probe;
+        *probe = (struct health_probe){.fd = -1};
+        int length = snprintf(probe->request, sizeof(probe->request),
+                              "GET /health HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n%s\r\n",
+                              target->port, pool->origin_auth_header);
+        if (length < 0 || (size_t)length >= sizeof(probe->request)) {
+            target->healthy = false;
+            continue;
+        }
+        probe->request_length = (size_t)length;
+        probe->fd = connect_backend(target->port, &probe->connecting);
+        if (probe->fd == -1) {
+            target->healthy = false;
+            continue;
+        }
+        // Health sockets use NULL event data so they cannot be mistaken for client connections.
+        if (!set_socket_filter(queue, NULL, probe->fd, &probe->filter, EVFILT_WRITE)) {
+            finish_health_probe(target, false);
+            continue;
+        }
+        pending = true;
+    }
+    return !pending || watch_health_timer(queue, HEALTH_DEADLINE_TIMER, HEALTH_CHECK_TIMEOUT_MS, EV_ONESHOT);
+}
+
+static bool send_health_request(int queue, struct health_probe *probe, bool hangup)
+{
+    if (probe->connecting && !connection_ready(probe->fd)) {
+        return false;
+    }
+    probe->connecting = false;
+    ssize_t sent = send(probe->fd, probe->request + probe->request_sent,
+                        probe->request_length - probe->request_sent, 0);
+    if (sent <= 0) {
+        return sent < 0 && can_retry_socket_io(hangup);
+    }
+    probe->request_sent += (size_t)sent;
+    return probe->request_sent < probe->request_length ||
+           set_socket_filter(queue, NULL, probe->fd, &probe->filter, EVFILT_READ);
+}
+
+static void service_health_event(int queue, struct backend_target *target, const struct kevent *event)
+{
+    struct health_probe *probe = &target->probe;
+    if (event->filter != probe->filter) {
+        return;
+    }
+    if (event->flags & EV_ERROR) {
+        finish_health_probe(target, false);
+        return;
+    }
+    bool hangup = (event->flags & EV_EOF) != 0;
+    if (event->filter == EVFILT_WRITE) {
+        if (!send_health_request(queue, probe, hangup)) {
+            finish_health_probe(target, false);
+        }
+        return;
+    }
+
+    char bytes[1024];
+    ssize_t received = recv(probe->fd, bytes, sizeof(bytes), 0);
+    if (received <= 0) {
+        if (received == 0 || !can_retry_socket_io(hangup)) {
+            finish_health_probe(target, false);
+        }
+        return;
+    }
+
+    size_t consumed;
+    enum proxy_header_result result = proxy_read_headers(probe->headers, &probe->header_length,
+                                                       bytes, (size_t)received, &consumed);
+    if (result != PROXY_HEADERS_MORE) {
+        struct proxy_response response = {0};
+        bool healthy = result == PROXY_HEADERS_READY &&
+                       proxy_parse_response(probe->headers, false, (time_t)-1, &response) &&
+                       response.status_code == 200;
+        finish_health_probe(target, healthy);
+    }
+}
+
 static void fail_backend(int queue, struct http_connection *client, int status)
 {
     bool response_started = client->backend->response_started;
@@ -552,9 +749,7 @@ static bool send_backend_request(int queue, struct http_connection *client, bool
 {
     struct backend_connection *backend = client->backend;
     if (backend->connecting) {
-        int error;
-        socklen_t length = sizeof(error);
-        if (getsockopt(backend->fd, SOL_SOCKET, SO_ERROR, &error, &length) == -1 || error != 0) {
+        if (!connection_ready(backend->fd)) {
             return false;
         }
         backend->connecting = false;
@@ -721,9 +916,17 @@ static int run_server(int server_fd, struct backend_pool *origins)
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
     }
+    for (size_t i = 0; i < origins->count; i++) {
+        origins->targets[i].probe.fd = -1;
+    }
 
     struct kevent events[MAX_EVENTS];
     int exit_status = 1;
+    if (origins->health_interval_ms > 0 &&
+        (!watch_health_timer(queue, HEALTH_INTERVAL_TIMER, origins->health_interval_ms, 0) ||
+         !start_health_probes(queue, origins))) {
+        goto close_connections;
+    }
     for (;;) {
         int count = kevent(queue, NULL, 0, events, MAX_EVENTS, NULL);
         if (count == -1) {
@@ -734,6 +937,7 @@ static int run_server(int server_fd, struct backend_pool *origins)
             break;
         }
 
+        bool health_checks_due = false;
         // Apply expired timers before I/O can start another request in the same slot.
         for (int i = 0; i < count; i++) {
             const struct kevent *event = &events[i];
@@ -742,6 +946,14 @@ static int run_server(int server_fd, struct backend_pool *origins)
                 goto close_connections;
             }
             if (event->filter == EVFILT_TIMER) {
+                if (event->ident == HEALTH_INTERVAL_TIMER) {
+                    health_checks_due = true;
+                    continue;
+                }
+                if (event->ident == HEALTH_DEADLINE_TIMER) {
+                    expire_health_probes(origins);
+                    continue;
+                }
                 struct http_connection *client = event->udata;
                 if (!client->timer_armed) {
                     continue;
@@ -763,6 +975,14 @@ static int run_server(int server_fd, struct backend_pool *origins)
             }
             if (event->ident == (uintptr_t)server_fd) {
                 listener = event;
+            } else if (event->udata == NULL) {
+                for (size_t i = 0; i < origins->count; i++) {
+                    struct backend_target *target = &origins->targets[i];
+                    if (event->ident == (uintptr_t)target->probe.fd) {
+                        service_health_event(queue, target, event);
+                        break;
+                    }
+                }
             } else {
                 struct http_connection *client = event->udata;
                 if (client->backend != NULL && event->ident == (uintptr_t)client->backend->fd) {
@@ -773,7 +993,10 @@ static int run_server(int server_fd, struct backend_pool *origins)
             }
         }
 
-        // Process the returned client events before accepting into a freed slot.
+        // Reuse slots and probe descriptors only after handling the returned socket events.
+        if (health_checks_due && !start_health_probes(queue, origins)) {
+            break;
+        }
         if (listener == NULL) {
             continue;
         }
@@ -798,6 +1021,7 @@ static int run_server(int server_fd, struct backend_pool *origins)
     }
 
 close_connections:
+    expire_health_probes(origins);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd != -1) {
             close_client(queue, &clients[i]);
@@ -807,47 +1031,162 @@ close_connections:
     return exit_status;
 }
 
+static size_t backend_index(const struct backend_pool *pool, int port)
+{
+    for (size_t i = 0; i < pool->count; i++) {
+        if (pool->targets[i].port == port) {
+            return i;
+        }
+    }
+    return pool->count;
+}
+
+static void add_default_route(struct backend_pool *pool, const char *path, int port, int standby_port)
+{
+    size_t index = backend_index(pool, port);
+    if (index < pool->count) {
+        size_t standby_index = backend_index(pool, standby_port);
+        pool->routes[pool->route_count++] = (struct proxy_route){
+            .path = path,
+            .path_length = strlen(path),
+            .backends = {.indices = {index}, .count = 1},
+            .standby = standby_index < pool->count ? &pool->targets[standby_index] : NULL,
+        };
+    }
+}
+
+static bool set_route(struct backend_pool *pool, const char *argument)
+{
+    const char *separator = strchr(argument, '=');
+    if (separator == NULL || *argument != '/') {
+        return false;
+    }
+    for (const char *p = argument; p < separator; p++) {
+        unsigned char byte = (unsigned char)*p;
+        if (byte < 0x21 || byte > 0x7e || strchr("?#\\", byte) != NULL) {
+            return false;
+        }
+    }
+
+    struct backend_group group = {0};
+    bool seen[MAX_BACKENDS] = {false};
+    const char *value = separator + 1;
+    for (;;) {
+        if (*value < '0' || *value > '9') {
+            return false;
+        }
+        char *end;
+        long requested = strtol(value, &end, 10);
+        if (requested < 1 || requested > UINT16_MAX || (*end != '\0' && *end != ',')) {
+            return false;
+        }
+        size_t index = backend_index(pool, (int)requested);
+        if (index == pool->count || seen[index]) {
+            return false;
+        }
+        seen[index] = true;
+        group.indices[group.count++] = index;
+        if (*end == '\0') {
+            break;
+        }
+        value = end + 1;
+    }
+
+    size_t path_length = (size_t)(separator - argument);
+    struct proxy_route *route = find_route(pool, argument, path_length);
+    if (route == NULL) {
+        if (pool->route_count == MAX_ROUTES) {
+            return false;
+        }
+        route = &pool->routes[pool->route_count++];
+    }
+    *route = (struct proxy_route){.path = argument, .path_length = path_length, .backends = group};
+    return true;
+}
+
 int main(int argc, char *argv[])
 {
     int port = LISTEN_PORT;
     struct backend_pool origins = {0};
+    const char *route_arguments[MAX_ROUTES];
+    size_t route_argument_count = 0;
     int option;
-    while ((option = getopt(argc, argv, "p:b:")) == 'p' || option == 'b') {
+    while ((option = getopt(argc, argv, "p:b:H:r:")) == 'p' ||
+           option == 'b' || option == 'H' || option == 'r') {
+        if (option == 'r') {
+            if (route_argument_count == MAX_ROUTES) {
+                fprintf(stderr, "At most %d route arguments can be specified\n", MAX_ROUTES);
+                return 1;
+            }
+            route_arguments[route_argument_count++] = optarg;
+            continue;
+        }
         char *end;
         long requested = strtol(optarg, &end, 10);
+        long maximum = option == 'H' ? INT_MAX / 1000 : UINT16_MAX;
         if (*optarg < '0' || *optarg > '9' || *end != '\0' ||
-            requested < 1 || requested > UINT16_MAX) {
-            fputs("Port must be an integer between 1 and 65535\n", stderr);
+            requested < 1 || requested > maximum) {
+            if (option == 'H') {
+                fprintf(stderr, "Health check interval must be an integer between 1 and %ld seconds\n", maximum);
+            } else {
+                fputs("Port must be an integer between 1 and 65535\n", stderr);
+            }
             return 1;
         }
         if (option == 'p') {
             port = (int)requested;
+        } else if (option == 'H') {
+            origins.health_interval_ms = (int)requested * 1000;
         } else {
             if (origins.count == MAX_BACKENDS) {
                 fprintf(stderr, "At most %d backend ports can be configured\n", MAX_BACKENDS);
                 return 1;
             }
-            origins.ports[origins.count++] = (int)requested;
+            origins.targets[origins.count++].port = (int)requested;
         }
     }
     if (option != -1 || optind != argc) {
-        fprintf(stderr, "Usage: %s [-p listen-port] [-b backend-port ...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-p listen-port] [-b backend-port ...] [-H health-check-seconds]\n"
+                        "       [-r /path=backend-port[,backend-port...] ...]\n", argv[0]);
         return 1;
     }
     if (origins.count == 0) {
-        origins = (struct backend_pool){.ports = {9000, 9001}, .count = 2};
+        origins.targets[0].port = DEFAULT_STATIC_PORT;
+        origins.targets[1].port = DEFAULT_CGI_PORT;
+        origins.count = 2;
     }
     for (size_t i = 0; i < origins.count; i++) {
-        if (origins.ports[i] == port) {
+        if (origins.targets[i].port == port) {
             fputs("A backend port cannot be the reverse proxy's listening port\n", stderr);
             return 1;
         }
         for (size_t j = 0; j < i; j++) {
-            if (origins.ports[i] == origins.ports[j]) {
+            if (origins.targets[i].port == origins.targets[j].port) {
                 fputs("Backend ports must be unique\n", stderr);
                 return 1;
             }
         }
+        origins.fallback.indices[origins.fallback.count++] = i;
+    }
+    add_default_route(&origins, "/static/index.html", DEFAULT_STATIC_PORT, 0);
+    add_default_route(&origins, "/cgi-bin/sum", DEFAULT_CGI_PORT, DEFAULT_STATIC_PORT);
+    for (size_t i = 0; i < route_argument_count; i++) {
+        if (!set_route(&origins, route_arguments[i])) {
+            fprintf(stderr, "Invalid route '%s'. Specify a path and unique, configured backend ports.\n",
+                    route_arguments[i]);
+            return 1;
+        }
+    }
+
+    const char *origin_token = getenv(HTTP_ORIGIN_TOKEN_ENV);
+    if (origin_token != NULL) {
+        if (!http_origin_token_valid(origin_token)) {
+            fprintf(stderr, "%s must contain %d hexadecimal characters\n",
+                    HTTP_ORIGIN_TOKEN_ENV, HTTP_ORIGIN_TOKEN_LENGTH);
+            return 1;
+        }
+        snprintf(origins.origin_auth_header, sizeof(origins.origin_auth_header),
+                 HTTP_ORIGIN_TOKEN_HEADER ": %s\r\n", origin_token);
     }
 
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {

@@ -37,8 +37,8 @@ struct upstream_connection {
     bool idle;
     bool reused;
     bool response_started;
-    char request[HTTP_MAX_HEADERS + 128];
-    size_t request_length;
+    char request_headers[HTTP_MAX_HEADERS + 128];
+    size_t request_header_length;
     size_t request_sent;
     char raw_headers[HTTP_MAX_HEADERS + 1];
     size_t raw_header_length;
@@ -348,13 +348,46 @@ static bool prepare_cached_response(int queue, struct http_connection *client, b
     return prepare_response(client, length, 200) && arm_client_timeout(queue, client);
 }
 
+static bool build_upstream_request(struct upstream_connection *upstream,
+                                   const struct http_request *request,
+                                   const char *path, const char *authority, bool is_post)
+{
+    char *headers = upstream->request_headers;
+    size_t capacity = sizeof(upstream->request_headers);
+    const char *slash = *path == '/' ? "" : "/";
+    int length = snprintf(headers, capacity, "%s %s%s %s\r\nHost: %s\r\nConnection: keep-alive\r\n",
+                          request->method, slash, path, request->version, authority);
+    if (length < 0 || (size_t)length >= capacity) {
+        return false;
+    }
+    size_t used = (size_t)length;
+    if (is_post) {
+        const char *content_type = request->content_type;
+        length = snprintf(headers + used, capacity - used, "Content-Length: %zu\r\n%s%s%s",
+                          request->content_length, content_type ? "Content-Type: " : "",
+                          content_type ? content_type : "", content_type ? "\r\n" : "");
+        if (length < 0 || (size_t)length >= capacity - used) {
+            return false;
+        }
+        used += (size_t)length;
+    }
+    if (capacity - used < 2) {
+        return false;
+    }
+    memcpy(headers + used, "\r\n", 2);
+    upstream->request_header_length = used + 2;
+    return true;
+}
+
 static bool start_upstream(int queue, struct http_connection *state, struct file_pool *pool)
 {
     bool client_keep_alive = state->keep_alive;
     state->keep_alive = false;
-    if (strcmp(state->request.method, "GET") != 0) {
+    bool is_get = strcmp(state->request.method, "GET") == 0;
+    bool is_post = strcmp(state->request.method, "POST") == 0;
+    if (!is_get && !is_post) {
         int length = http_write_response(state->response, sizeof(state->response),
-                                         state->request.version, 405, "", "Allow: GET\r\n",
+                                         state->request.version, 405, "", "Allow: GET, POST\r\n",
                                          false);
         return prepare_response(state, length, 405);
     }
@@ -363,7 +396,7 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
     if (strncmp(uri, "http://", sizeof("http://") - 1) != 0) {
         return queue_response(state, pool, 501);
     }
-    if (state->request.content_length != 0) {
+    if (is_get && state->request.content_length != 0) {
         return queue_response(state, pool, 400);
     }
     char authority[sizeof("127.0.0.1:65535")];
@@ -384,7 +417,7 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
     }
 
     const char *path = host + host_length;
-    if (pool != NULL && is_offloaded_asset(path)) {
+    if (is_get && pool != NULL && is_offloaded_asset(path)) {
         state->keep_alive = client_keep_alive;
         int status = submit_static_file(state, pool, path);
         return status == 0 || queue_response(state, pool, status);
@@ -395,7 +428,7 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
         state->cache_request_at = (time_t)-1;
         // Keep the HTML request on the origin path when static offloading is enabled.
         bool index_from_origin = pool != NULL && request_path_is(path, STATIC_INDEX);
-        if (!index_from_origin && !state->request.bypass_cache &&
+        if (is_get && !index_from_origin && !state->request.bypass_cache &&
             strcmp(state->request.version, "HTTP/1.1") == 0) {
             time_t now = proxy_cache_now();
             if (now >= 0) {
@@ -435,15 +468,10 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
     upstream->header_sent = 0;
     upstream->response = (struct proxy_response){0};
 
-    const char *slash = *path == '/' ? "" : "/";
-    int length = snprintf(upstream->request, sizeof(upstream->request),
-                          "GET %s%s %s\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
-                          slash, path, state->request.version, authority);
-    if (length < 0 || (size_t)length >= sizeof(upstream->request)) {
+    if (!build_upstream_request(upstream, &state->request, path, authority, is_post)) {
         close_upstream(queue, state);
         return queue_response(state, pool, 500);
     }
-    upstream->request_length = (size_t)length;
     if (!set_upstream_filter(queue, state, EVFILT_WRITE) || !arm_upstream_timeout(queue, state)) {
         close_upstream(queue, state);
         return queue_response(state, pool, 500);
@@ -758,7 +786,8 @@ static void fail_upstream(int queue, struct file_pool *pool, struct http_connect
 static void upstream_disconnected(int queue, struct file_pool *pool, struct http_connection *client)
 {
     struct upstream_connection *upstream = client->upstream;
-    if (!upstream->reused || upstream->raw_header_length != 0) {
+    if (!upstream->reused || upstream->raw_header_length != 0 ||
+        strcmp(client->request.method, "GET") != 0) {
         fail_upstream(queue, pool, client, 502);
         return;
     }
@@ -782,14 +811,28 @@ static bool send_upstream_request(int queue, struct http_connection *client, boo
         upstream->connecting = false;
     }
 
-    ssize_t sent = send(upstream->fd, upstream->request + upstream->request_sent,
-                        upstream->request_length - upstream->request_sent, 0);
+    size_t offset = upstream->request_sent;
+    const void *data;
+    size_t length;
+    if (offset < upstream->request_header_length) {
+        data = upstream->request_headers + offset;
+        length = upstream->request_header_length - offset;
+    } else {
+        offset -= upstream->request_header_length;
+        if (offset >= client->request.content_length || client->request.body == NULL) {
+            return false;
+        }
+        data = client->request.body + offset;
+        length = client->request.content_length - offset;
+    }
+    ssize_t sent = send(upstream->fd, data, length, 0);
     if (sent <= 0) {
         return sent < 0 && can_retry_socket_io(hangup);
     }
     upstream->request_sent += (size_t)sent;
+    size_t request_length = upstream->request_header_length + client->request.content_length;
     return arm_upstream_timeout(queue, client) &&
-           (upstream->request_sent < upstream->request_length ||
+           (upstream->request_sent < request_length ||
             set_upstream_filter(queue, client, EVFILT_READ));
 }
 

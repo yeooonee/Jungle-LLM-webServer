@@ -103,10 +103,15 @@
       <li class="route-stage">
         <strong>리버스 프록시</strong>
         <code>9200</code>
-        <span class="text-small text-muted">Round-Robin</span>
+        <span class="text-small text-muted">경로별 원 서버 선택</span>
       </li>
       <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
-      <li class="route-stage"><strong>C 원 서버</strong><span><code>9000</code> 또는 <code>9001</code></span></li>
+      <li class="route-stage">
+        <strong>C 원 서버</strong>
+        <span><code>9000</code> · HTML</span>
+        <span><code>9001</code> · CGI 기본</span>
+        <span class="text-small text-muted">CGI 서버 장애 시 <code>9000</code></span>
+      </li>
     </ol>
   </div>
 

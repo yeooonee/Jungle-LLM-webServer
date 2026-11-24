@@ -195,10 +195,11 @@ bool proxy_parse_response(char *raw_headers, bool client_keep_alive, time_t cach
         status[11] < '0' || status[11] > '9' || (status[12] != ' ' && status[12] != '\0')) {
         return false;
     }
+    response->status_code = (status[9] - '0') * 100 + (status[10] - '0') * 10 + (status[11] - '0');
     bool implicit_keep_alive = status[7] == '1';
-    bool no_content = strncmp(status + 9, "204", 3) == 0;
-    bool no_body = no_content || strncmp(status + 9, "304", 3) == 0;
-    bool cache_blocked = cache_request_at < 0 || strncmp(status + 9, "200", 3) != 0;
+    bool no_content = response->status_code == 204;
+    bool no_body = no_content || response->status_code == 304;
+    bool cache_blocked = cache_request_at < 0 || response->status_code != 200;
     const char *cache_control = NULL;
     const char *date = NULL;
     const char *options = NULL;

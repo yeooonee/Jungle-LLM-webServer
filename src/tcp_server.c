@@ -29,6 +29,7 @@ enum {
 struct http_connection {
     int fd;
     int slot;
+    const char *required_origin_token;
     uint64_t connection_id;
     short filter;
     char input[BUFFER_SIZE];
@@ -65,6 +66,21 @@ static int configure_socket(int fd)
     return fcntl(fd, F_SETFD, FD_CLOEXEC);
 }
 
+static bool origin_request_allowed(const char *expected, const char *received)
+{
+    if (expected == NULL) {
+        return true;
+    }
+    if (received == NULL || strlen(received) != HTTP_ORIGIN_TOKEN_LENGTH) {
+        return false;
+    }
+    volatile unsigned char difference = 0;
+    for (size_t i = 0; i < HTTP_ORIGIN_TOKEN_LENGTH; i++) {
+        difference |= (unsigned char)expected[i] ^ (unsigned char)received[i];
+    }
+    return difference == 0;
+}
+
 // Return 0 while more bytes are needed, or an HTTP status when ready to reply.
 static int read_request_bytes(struct http_connection *state, const char *data,
                               size_t length, size_t *consumed)
@@ -87,6 +103,9 @@ static int read_request_bytes(struct http_connection *state, const char *data,
             int status = http_parse_headers(state->headers, &state->request, HELLO_ETAG);
             if (status != 200) {
                 return status;
+            }
+            if (!origin_request_allowed(state->required_origin_token, state->request.origin_token)) {
+                return 403;
             }
             if (state->request.content_length > 0) {
                 state->request.body = malloc(state->request.content_length);
@@ -172,6 +191,9 @@ static bool queue_response(struct http_connection *state, struct file_pool *pool
                 state->file_pending = true;
                 return true;
             }
+        } else if (request_path_is(path, "/health")) {
+            body = "ok";
+            extra_headers = "Cache-Control: no-store\r\n";
         } else if (request_path_is(path, "/redirect/permanent")) {
             status = 301;
             extra_headers = "Location: /\r\n";
@@ -415,7 +437,7 @@ static void close_client(int queue, struct http_connection *client, struct file_
 
 enum { ACCEPT_RETRY = -1, ACCEPT_FAILED = -2 };
 
-static int accept_client(int server_fd, struct http_connection clients[])
+static int accept_client(int server_fd, struct http_connection clients[], const char *origin_token)
 {
     int fd = accept(server_fd, NULL, NULL);
     if (fd == -1) {
@@ -444,6 +466,7 @@ static int accept_client(int server_fd, struct http_connection clients[])
     clients[slot] = (struct http_connection){
         .fd = fd,
         .slot = slot,
+        .required_origin_token = origin_token,
         .connection_id = clients[slot].connection_id + 1,
         .filter = EVFILT_READ,
     };
@@ -629,7 +652,7 @@ static void reap_cgi_children(int queue, struct file_pool *pool,
     }
 }
 
-static int run_server(int server_fd, struct file_pool *pool)
+static int run_server(int server_fd, struct file_pool *pool, const char *origin_token)
 {
     int queue = kqueue();
     if (queue == -1) {
@@ -738,7 +761,7 @@ static int run_server(int server_fd, struct file_pool *pool)
             break;
         }
 
-        int slot = accept_client(server_fd, clients);
+        int slot = accept_client(server_fd, clients, origin_token);
         if (slot == ACCEPT_FAILED) {
             break;
         }
@@ -778,6 +801,12 @@ int main(int argc, char *argv[])
     }
     if (option != -1 || argc - optind > 1) {
         fprintf(stderr, "Usage: %s [-p port] [static-root]\n", argv[0]);
+        return 1;
+    }
+    const char *origin_token = getenv(HTTP_ORIGIN_TOKEN_ENV);
+    if (origin_token != NULL && !http_origin_token_valid(origin_token)) {
+        fprintf(stderr, "%s must contain %d hexadecimal characters\n",
+                HTTP_ORIGIN_TOKEN_ENV, HTTP_ORIGIN_TOKEN_LENGTH);
         return 1;
     }
 
@@ -846,7 +875,7 @@ int main(int argc, char *argv[])
 
     printf("HTTP server listening on http://127.0.0.1:%d\n", port);
 
-    int result = run_server(server_fd, pool);
+    int result = run_server(server_fd, pool, origin_token);
     if (pool != NULL) {
         file_pool_destroy(pool);
         close(root_fd);

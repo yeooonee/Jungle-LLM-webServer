@@ -3,14 +3,35 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+static bool locate_cgi_sum(char program[PATH_MAX])
+{
+    char executable[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0 || realpath(executable, program) == NULL) {
+        return false;
+    }
+    char *slash = strrchr(program, '/');
+    if (slash == NULL || (size_t)(slash + 1 - program) + sizeof("cgi_sum") > PATH_MAX) {
+        return false;
+    }
+    memcpy(slash + 1, "cgi_sum", sizeof("cgi_sum"));
+    return true;
+}
+
 struct cgi_process *cgi_start_sum(const char *query, const char *version, unsigned int server_port)
 {
+    char program[PATH_MAX];
+    if (!locate_cgi_sum(program)) {
+        return NULL;
+    }
     char query_string[HTTP_MAX_HEADERS + sizeof("QUERY_STRING=")];
     char protocol[32];
     char port[sizeof("SERVER_PORT=65535")];
@@ -22,7 +43,7 @@ struct cgi_process *cgi_start_sum(const char *query, const char *version, unsign
         port_length < 0 || (size_t)port_length >= sizeof(port)) {
         return NULL;
     }
-    char *arguments[] = {"./cgi_sum", NULL};
+    char *arguments[] = {program, NULL};
     char *environment[] = {
         "GATEWAY_INTERFACE=CGI/1.1", "REQUEST_METHOD=GET", "SCRIPT_NAME=/cgi-bin/sum",
         "SERVER_NAME=127.0.0.1", "SERVER_SOFTWARE=Jungle-LLM-webServer",

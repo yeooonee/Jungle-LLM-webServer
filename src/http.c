@@ -10,6 +10,12 @@ static bool is_digit(unsigned char ch)
     return ch >= '0' && ch <= '9';
 }
 
+bool http_origin_token_valid(const char *token)
+{
+    return strlen(token) == HTTP_ORIGIN_TOKEN_LENGTH &&
+           strspn(token, "0123456789abcdefABCDEF") == HTTP_ORIGIN_TOKEN_LENGTH;
+}
+
 static bool is_token(const char *value)
 {
     if (*value == '\0') {
@@ -131,7 +137,8 @@ static int parse_content_length(const char *value, size_t *length)
     return 200;
 }
 
-static bool parse_connection(char *value, struct http_request *request)
+static bool parse_connection(char *value, struct http_request *request,
+                             bool *connection_content_type)
 {
     while (value != NULL) {
         char *comma = strchr(value, ',');
@@ -146,6 +153,8 @@ static bool parse_connection(char *value, struct http_request *request)
             request->connection_close = true;
         } else if (strcasecmp(value, "keep-alive") == 0) {
             request->connection_keep_alive = true;
+        } else if (strcasecmp(value, "Content-Type") == 0) {
+            *connection_content_type = true;
         }
         value = comma == NULL ? NULL : comma + 1;
     }
@@ -203,6 +212,7 @@ int http_parse_headers(char *headers, struct http_request *request,
     bool has_length = false;
     bool has_transfer_encoding = false;
     bool unsupported_expectation = false;
+    bool connection_content_type = false;
 
     while ((line = next_line(&headers)) != NULL && *line) {
         char *value = strchr(line, ':');
@@ -226,6 +236,12 @@ int http_parse_headers(char *headers, struct http_request *request,
                 return 400;
             }
             request->host = value;
+        } else if (strcasecmp(line, HTTP_ORIGIN_TOKEN_HEADER) == 0) {
+            if (request->origin_token != NULL) {
+                return 400;
+            }
+            request->origin_token = value;
+            request->bypass_cache = true;
         } else if (strcasecmp(line, "Content-Length") == 0) {
             if (has_length) {
                 return 400;
@@ -235,8 +251,10 @@ int http_parse_headers(char *headers, struct http_request *request,
             if (status != 200) {
                 return status;
             }
+        } else if (strcasecmp(line, "Content-Type") == 0 && request->content_type == NULL) {
+            request->content_type = value;
         } else if (strcasecmp(line, "Connection") == 0) {
-            if (!parse_connection(value, request)) {
+            if (!parse_connection(value, request, &connection_content_type)) {
                 return 400;
             }
         } else if (strcasecmp(line, "Transfer-Encoding") == 0) {
@@ -270,6 +288,9 @@ int http_parse_headers(char *headers, struct http_request *request,
     if (*request->uri != '/' && strncmp(request->uri, "http://", 7) != 0 &&
         strncmp(request->uri, "https://", 8) != 0) {
         return 400;
+    }
+    if (connection_content_type) {
+        request->content_type = NULL;
     }
     return 200;
 }

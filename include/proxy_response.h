@@ -6,6 +6,7 @@
 #include <time.h>
 
 struct proxy_response {
+    int status_code;
     bool has_length;
     bool origin_keep_alive;
     bool client_keep_alive;
