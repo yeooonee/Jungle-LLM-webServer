@@ -36,29 +36,22 @@ static long now_ms(void) {
 }
 
 // ① 자식: stdin/stdout/stderr를 바꿔 끼우고 프로그램으로 변신. 돌아오면 exec 실패
-static void run_child(int client_fd, int in[2], int out[2], const char *prog, const char *method,
-                      const char *query, size_t body_len, const char *content_type) {
+// 스레드가 있는 프로세스에서 fork하면 자식엔 스레드 1개만 남음 → 다른 스레드가 잡고 있던 잠금(malloc·setenv·
+// localtime·printf 내부)이 영원히 잠긴 채 복사될 수 있음. 그래서 자식은 잠금 없는 시스템 호출만 씀 (POSIX
+// async-signal-safe 목록: dup2·close·write·execve·_exit). 환경변수·로그 줄은 부모가 미리 만들어 넘김
+static void run_child(int client_fd, int in[2], int out[2], const char *prog,
+                      char *const envp[], const char *log_line, size_t log_len) {
     dup2(in[0], STDIN_FILENO);     // 프로그램의 scanf/read  ← 부모가 쓴 POST 본문
     dup2(out[1], STDOUT_FILENO);   // 프로그램의 printf      → 부모가 읽음
     dup2(cgi_log, STDERR_FILENO);  // 프로그램의 에러 출력   → 로그 파일
     close(in[0]); close(in[1]); close(out[0]); close(out[1]);
     close(client_fd);              // 손님 소켓은 부모만 다룸
 
-    char len[32];
-    snprintf(len, sizeof(len), "%zu", body_len);
-    setenv("REQUEST_METHOD", method, 1);
-    setenv("QUERY_STRING", query, 1);
-    setenv("CONTENT_LENGTH", len, 1);
-    setenv("CONTENT_TYPE", content_type, 1);
-
-    // 로그 머리줄: 어느 요청이 남긴 에러인지 구분
-    char ts[32];
-    time_t t = time(NULL);
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
-    dprintf(STDERR_FILENO, "[%s] %s %s?%s\n", ts, method, prog, query);
-
-    execl(prog, prog, (char *)NULL);
-    dprintf(STDERR_FILENO, "exec failed: %s\n", strerror(errno));
+    write(STDERR_FILENO, log_line, log_len);   // 로그 머리줄: 어느 요청이 남긴 에러인지 구분
+    char *const argv[] = { (char *)prog, NULL };
+    execve(prog, argv, envp);      // 환경변수 = envp 4개만 (부모 환경은 안 물려줌)
+    static const char msg[] = "exec failed\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
     _exit(127);                    // exit 대신 _exit: 부모에게서 복사된 stdio 버퍼를 또 비우지 않게
 }
 
@@ -161,6 +154,21 @@ void serve_cgi(int fd, const char *method, const char *url_path,
     const char *q = strchr(url_path, '?');
     const char *query = q ? q + 1 : "";   // 규격: QUERY_STRING은 디코딩하지 않은 원본
 
+    // 자식에 넘길 환경변수·로그 줄은 fork 전에 부모가 만듦 (run_child 주석 참고)
+    char e_method[64], e_query[1100], e_len[48], e_type[300];
+    snprintf(e_method, sizeof(e_method), "REQUEST_METHOD=%s", method);
+    snprintf(e_query, sizeof(e_query), "QUERY_STRING=%s", query);
+    snprintf(e_len, sizeof(e_len), "CONTENT_LENGTH=%zu", body_len);
+    snprintf(e_type, sizeof(e_type), "CONTENT_TYPE=%s", content_type);
+    char *const envp[] = { e_method, e_query, e_len, e_type, NULL };
+
+    char ts[32], log_line[PATH_MAX + 1200];
+    time_t t = time(NULL);
+    struct tm tm;
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime_r(&t, &tm));
+    int log_len = snprintf(log_line, sizeof(log_line), "[%s] %s %s?%s\n", ts, method, prog, query);
+    if (log_len >= (int)sizeof(log_line)) log_len = sizeof(log_line) - 1;
+
     char *out = malloc(cgi_max_output + 1);
     int in[2], outp[2];
     if (!out || pipe(in) < 0) { free(out); send_response(fd, 500, "Internal Server Error", "Internal Server Error"); return; }
@@ -177,7 +185,7 @@ void serve_cgi(int fd, const char *method, const char *url_path,
         send_response(fd, 500, "Internal Server Error", "Internal Server Error");
         return;
     }
-    if (pid == 0) run_child(fd, in, outp, prog, method, query, body_len, content_type);
+    if (pid == 0) run_child(fd, in, outp, prog, envp, log_line, (size_t)log_len);
 
     // 2. 부모: 자식용 끝은 닫기. 특히 outp[1]을 안 닫으면 쓰는 끝이 남아 read가 EOF(0)를 영영 못 받음
     close(in[0]);
