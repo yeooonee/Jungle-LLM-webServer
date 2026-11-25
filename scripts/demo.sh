@@ -83,7 +83,7 @@ show_http_exchange() {
     local body="$demo_dir/response.body"
 
     if ! request_through_chain "$path" --http1.1 --verbose \
-        -D "$headers" -o "$body" 2>"$trace"; then
+        -H 'Cache-Control: no-cache' -D "$headers" -o "$body" 2>"$trace"; then
         cat "$trace" >&2
         return 1
     fi
@@ -127,8 +127,8 @@ unset JUNGLE_ORIGIN_TOKEN
 start_server tcp_server "$html_port" ./public
 start_server tcp_server "$cgi_port" ./public
 start_server tcp_server_reverse "$reverse_port" -b "$html_port" -b "$cgi_port" \
-    -r "/static/index.html=$html_port" -r "/cgi-bin/sum=$cgi_port"
-start_server tcp_server_forward "$forward_port" -o "$reverse_port" ./public
+    -r "/static/index.html=$html_port" -r "/cgi-bin/sum=$cgi_port" ./public
+start_server tcp_server_forward "$forward_port" -o "$reverse_port"
 
 show_step '1. HTML · CGI'
 show_http_exchange /static/index.html

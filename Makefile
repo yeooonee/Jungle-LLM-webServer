@@ -19,13 +19,14 @@ $(BUILD_DIR)/tcp_server: src/tcp_server.c src/http.c src/file_pool.c src/cgi.c \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 $(BUILD_DIR)/tcp_server_forward: src/tcp_server_forward.c src/proxy_cache.c src/proxy_response.c \
-                                src/http.c src/file_pool.c include/proxy_cache.h \
-                                include/proxy_response.h include/http.h include/file_pool.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+                                src/http.c include/proxy_cache.h include/proxy_response.h \
+                                include/http.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 $(BUILD_DIR)/tcp_server_reverse: src/tcp_server_reverse.c src/proxy_response.c src/http.c \
-                                include/proxy_response.h include/http.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+                                src/file_pool.c include/proxy_response.h include/http.h \
+                                include/file_pool.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 $(BUILD_DIR)/cgi_sum: src/cgi_sum.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)

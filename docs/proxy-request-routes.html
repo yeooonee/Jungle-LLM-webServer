@@ -1,4 +1,4 @@
-<section id="proxy-request-routes" aria-label="포워드 프록시의 요청 및 응답 경로">
+<section id="proxy-request-routes" aria-label="포워드와 리버스 프록시의 요청 및 응답 경로">
   <style>
     #proxy-request-routes .route-files {
       display: flex;
@@ -79,12 +79,14 @@
       <code>/static/logo.png</code>
       <code>/static/style.css</code>
     </div>
-    <ol class="route-flow" aria-label="클라이언트와 포워드 프록시 사이의 요청과 응답">
+    <ol class="route-flow" aria-label="클라이언트에서 포워드 프록시를 거쳐 리버스 프록시까지">
       <li class="route-stage"><strong>클라이언트</strong></li>
       <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
+      <li class="route-stage"><strong>포워드 프록시</strong><code>9100</code></li>
+      <li class="route-connector" aria-hidden="true"><span class="route-to"></span><span class="route-from"></span></li>
       <li class="route-stage">
-        <strong>포워드 프록시</strong>
-        <code>9100</code>
+        <strong>리버스 프록시</strong>
+        <code>9200</code>
         <span class="text-small text-muted"><code>./public</code>에서 읽어 응답</span>
       </li>
     </ol>

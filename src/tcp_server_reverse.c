@@ -1,3 +1,4 @@
+#include "file_pool.h"
 #include "http.h"
 #include "proxy_response.h"
 
@@ -24,7 +25,7 @@ enum {
     MAX_ROUTES = 16,
     MAX_CLIENTS = 10000,
     ACCEPT_BATCH_SIZE = 64,
-    MAX_EVENTS = MAX_CLIENTS * 3 + MAX_BACKENDS + 5,
+    MAX_EVENTS = MAX_CLIENTS * 3 + MAX_BACKENDS + 6,
     BUFFER_SIZE = 4096,
     ORIGIN_AUTH_HEADER_CAPACITY = sizeof(HTTP_ORIGIN_TOKEN_HEADER ": \r\n") + HTTP_ORIGIN_TOKEN_LENGTH,
     CLIENT_TIMEOUT_MS = 5000,
@@ -91,9 +92,14 @@ struct backend_connection {
 struct http_connection {
     int fd;
     int slot;
+    uint64_t connection_id;
     short filter;
     struct backend_pool *origins;
     struct backend_connection *backend;
+    struct file_pool *file_pool;
+    struct file_job *file;
+    size_t file_sent;
+    bool file_pending;
     char input[BUFFER_SIZE];
     size_t input_length;
     bool timer_armed;
@@ -331,10 +337,8 @@ static bool build_backend_request(const struct http_connection *client,
     return true;
 }
 
-static bool queue_response(struct http_connection *state, int status)
+static bool prepare_response(struct http_connection *state, int length, int status)
 {
-    int length = http_write_response(state->response, sizeof(state->response),
-                                     state->request.version, status, "", "", state->keep_alive);
     if (length < 0 || (size_t)length >= sizeof(state->response)) {
         return false;
     }
@@ -342,6 +346,22 @@ static bool queue_response(struct http_connection *state, int status)
     state->response_sent = 0;
     state->interim_response = status == 100;
     return true;
+}
+
+static bool queue_response(struct http_connection *state, int status)
+{
+    int length = http_write_response(state->response, sizeof(state->response),
+                                     state->request.version, status, "", "", state->keep_alive);
+    return prepare_response(state, length, status);
+}
+
+static bool is_offloaded_asset(const char *uri)
+{
+    static const char logo[] = "/static/logo.png";
+    static const char css[] = "/static/style.css";
+    size_t length = strcspn(uri, "?");
+    return (length == sizeof(logo) - 1 && memcmp(uri, logo, length) == 0) ||
+           (length == sizeof(css) - 1 && memcmp(uri, css, length) == 0);
 }
 
 static void close_backend(struct http_connection *client)
@@ -387,6 +407,12 @@ static void reset_request(struct http_connection *state)
 {
     free(state->request.body);
     state->request = (struct http_request){0};
+    if (state->file != NULL) {
+        file_pool_release(state->file_pool, state->file);
+        state->file = NULL;
+    }
+    state->file_sent = 0;
+    state->file_pending = false;
     state->header_length = 0;
     state->headers_complete = false;
     state->body_received = 0;
@@ -418,6 +444,14 @@ static bool process_client_input(int queue, struct http_connection *state)
         state->keep_alive = !state->request.connection_close &&
                             (strcmp(state->request.version, "HTTP/1.1") == 0 ||
                              state->request.connection_keep_alive);
+        if (state->file_pool != NULL && strcmp(state->request.method, "GET") == 0 &&
+            state->request.content_length == 0 && is_offloaded_asset(state->request.uri)) {
+            const char *path = state->request.uri + sizeof("/static/") - 1;
+            int file_status = file_pool_submit_open(state->file_pool, state->slot,
+                                                    state->connection_id, path);
+            state->file_pending = file_status == 0;
+            return state->file_pending || queue_response(state, file_status);
+        }
         return start_backend(queue, state);
     }
     return queue_response(state, status);
@@ -499,6 +533,27 @@ static bool send_backend_response(int queue, struct http_connection *client, boo
     return set_backend_filter(queue, client, EVFILT_READ) && arm_timeout(queue, client);
 }
 
+static bool send_file_chunk(int queue, struct http_connection *state, bool hangup)
+{
+    struct file_job *job = state->file;
+    ssize_t sent = send(state->fd, job->data + state->file_sent,
+                        job->length - state->file_sent, 0);
+    if (sent <= 0) {
+        return sent < 0 && can_retry_socket_io(hangup);
+    }
+    state->file_sent += (size_t)sent;
+    job->remaining -= (off_t)sent;
+    if (job->remaining == 0) {
+        return finish_response(queue, state);
+    }
+    if (state->file_sent == job->length) {
+        state->file = NULL;
+        state->file_pending = true;
+        file_pool_submit_read(state->file_pool, job);
+    }
+    return arm_timeout(queue, state);
+}
+
 static bool handle_client(int queue, struct http_connection *state, bool hangup)
 {
     if (state->backend != NULL) {
@@ -517,6 +572,10 @@ static bool handle_client(int queue, struct http_connection *state, bool hangup)
         return can_retry_socket_io(hangup);
     }
 
+    if (state->file != NULL && state->response_sent == state->response_length) {
+        return send_file_chunk(queue, state, hangup);
+    }
+
     ssize_t sent = send(state->fd, state->response + state->response_sent,
                         state->response_length - state->response_sent, 0);
     if (sent <= 0) {
@@ -533,6 +592,9 @@ static bool handle_client(int queue, struct http_connection *state, bool hangup)
         state->interim_response = false;
         return arm_timeout(queue, state);
     }
+    if (state->file != NULL && state->file->remaining > 0) {
+        return arm_timeout(queue, state);
+    }
     return finish_response(queue, state);
 }
 
@@ -547,7 +609,8 @@ static void close_client(int queue, struct http_connection *client)
 
 enum { ACCEPT_RETRY = -1, ACCEPT_FAILED = -2 };
 
-static int accept_client(int server_fd, struct http_connection clients[], struct backend_pool *origins)
+static int accept_client(int server_fd, struct http_connection clients[],
+                         struct backend_pool *origins, struct file_pool *file_pool)
 {
     int fd = accept(server_fd, NULL, NULL);
     if (fd == -1) {
@@ -576,8 +639,10 @@ static int accept_client(int server_fd, struct http_connection clients[], struct
     clients[slot] = (struct http_connection){
         .fd = fd,
         .slot = slot,
+        .connection_id = clients[slot].connection_id + 1,
         .filter = EVFILT_READ,
         .origins = origins,
+        .file_pool = file_pool,
     };
     return slot;
 }
@@ -877,13 +942,60 @@ static void service_kqueue_client(int queue, const struct kevent *event)
     short next_filter = client->response_length > 0 ? EVFILT_WRITE : EVFILT_READ;
     if (client->backend != NULL) {
         next_filter = backend_response_pending(client) ? EVFILT_WRITE : 0;
+    } else if (client->file_pending) {
+        next_filter = 0;
     }
     if (!set_client_filter(queue, client, next_filter)) {
         close_client(queue, client);
     }
 }
 
-static int run_server(int server_fd, struct backend_pool *origins)
+static bool finish_file_job(struct http_connection *client, struct file_pool *pool,
+                            struct file_job *job)
+{
+    client->file_pending = false;
+    if (job->status != 200) {
+        int status = job->status;
+        file_pool_release(pool, job);
+        // A failed read after the headers were sent closes the connection.
+        return client->response_length == 0 && queue_response(client, status);
+    }
+
+    client->file = job;
+    client->file_sent = 0;
+    if (client->response_length > 0) {
+        return true;
+    }
+    int length = http_write_file_headers(client->response, sizeof(client->response),
+                                        client->request.version, job->content_type,
+                                        (uintmax_t)job->remaining, "", client->keep_alive);
+    return prepare_response(client, length, 200);
+}
+
+static bool service_file_completions(int queue, struct file_pool *pool,
+                                     struct http_connection clients[])
+{
+    if (file_pool_drain_notifications(pool) == -1) {
+        perror("read: file completion");
+        return false;
+    }
+    struct file_job *job;
+    while ((job = file_pool_take_completed(pool)) != NULL) {
+        struct http_connection *client = &clients[job->slot];
+        if (client->fd == -1 || client->connection_id != job->connection_id ||
+            !client->file_pending) {
+            file_pool_release(pool, job);
+            continue;
+        }
+        if (!finish_file_job(client, pool, job) ||
+            !set_client_filter(queue, client, EVFILT_WRITE) || !arm_timeout(queue, client)) {
+            close_client(queue, client);
+        }
+    }
+    return true;
+}
+
+static int run_server(int server_fd, struct backend_pool *origins, struct file_pool *file_pool)
 {
     int queue = kqueue();
     if (queue == -1) {
@@ -914,6 +1026,15 @@ static int run_server(int server_fd, struct backend_pool *origins)
         perror("kevent: watch server");
         close(queue);
         return 1;
+    }
+    int notification_fd = -1;
+    if (file_pool != NULL) {
+        notification_fd = file_pool_notification_fd(file_pool);
+        if (watch_read(queue, notification_fd, NULL) == -1) {
+            perror("kevent: watch file completion");
+            close(queue);
+            return 1;
+        }
     }
     struct http_connection *clients = calloc(MAX_CLIENTS, sizeof(*clients));
     if (clients == NULL) {
@@ -983,6 +1104,14 @@ static int run_server(int server_fd, struct backend_pool *origins)
             }
             if (event->ident == (uintptr_t)server_fd) {
                 listener = event;
+            } else if (event->ident == (uintptr_t)notification_fd) {
+                if (event->flags & (EV_ERROR | EV_EOF)) {
+                    fputs("File completion pipe failed\n", stderr);
+                    goto close_connections;
+                }
+                if (!service_file_completions(queue, file_pool, clients)) {
+                    goto close_connections;
+                }
             } else if (event->udata == NULL) {
                 for (size_t i = 0; i < origins->count; i++) {
                     struct backend_target *target = &origins->targets[i];
@@ -1014,7 +1143,7 @@ static int run_server(int server_fd, struct backend_pool *origins)
         }
 
         for (int i = 0; i < ACCEPT_BATCH_SIZE; i++) {
-            int slot = accept_client(server_fd, clients, origins);
+            int slot = accept_client(server_fd, clients, origins, file_pool);
             if (slot == ACCEPT_FAILED) {
                 goto close_connections;
             }
@@ -1157,9 +1286,9 @@ int main(int argc, char *argv[])
             origins.targets[origins.count++].port = (int)requested;
         }
     }
-    if (option != -1 || optind != argc) {
+    if (option != -1 || argc - optind > 1) {
         fprintf(stderr, "Usage: %s [-p listen-port] [-b backend-port ...] [-H health-check-seconds]\n"
-                        "       [-r /path=backend-port[,backend-port...] ...]\n", argv[0]);
+                        "       [-r /path=backend-port[,backend-port...] ...] [static-root]\n", argv[0]);
         return 1;
     }
     if (origins.count == 0) {
@@ -1245,9 +1374,32 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    int root_fd = -1;
+    struct file_pool *file_pool = NULL;
+    if (optind < argc) {
+        const char *root = argv[optind];
+        root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (root_fd == -1) {
+            perror(root);
+            close(server_fd);
+            return 1;
+        }
+        file_pool = file_pool_create(root_fd, MAX_CLIENTS);
+        if (file_pool == NULL) {
+            perror("file worker pool");
+            close(root_fd);
+            close(server_fd);
+            return 1;
+        }
+    }
+
     printf("Reverse proxy listening on http://127.0.0.1:%d\n", port);
 
-    int result = run_server(server_fd, &origins);
+    int result = run_server(server_fd, &origins, file_pool);
+    if (file_pool != NULL) {
+        file_pool_destroy(file_pool);
+        close(root_fd);
+    }
     close(server_fd);
     return result;
 }

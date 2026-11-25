@@ -1,4 +1,3 @@
-#include "file_pool.h"
 #include "http.h"
 #include "proxy_cache.h"
 
@@ -21,14 +20,13 @@ enum {
     DEFAULT_ORIGIN_PORT = 9000,
     MAX_CLIENTS = 10000,
     ACCEPT_BATCH_SIZE = 64,
-    MAX_EVENTS = MAX_CLIENTS * 3 + 4,
+    MAX_EVENTS = MAX_CLIENTS * 3 + 3,
     BUFFER_SIZE = 4096,
     CLIENT_TIMEOUT_MS = 5000,
     PROXY_TIMEOUT_MS = 5000
 };
 #define HELLO_ETAG "\"hello-v1\""
 #define STATIC_PREFIX "/static/"
-#define STATIC_INDEX STATIC_PREFIX "index.html"
 #define ORIGIN_ADDRESS "127.0.0.1"
 
 struct upstream_connection {
@@ -52,7 +50,6 @@ struct http_connection {
     int fd;
     int slot;
     int origin_port;
-    uint64_t connection_id;
     short filter;
     char input[BUFFER_SIZE];
     size_t input_length;
@@ -67,9 +64,6 @@ struct http_connection {
     size_t response_sent;
     bool interim_response;
     bool keep_alive;
-    bool file_pending;
-    struct file_job *file;
-    size_t file_sent;
     struct upstream_connection *upstream;
     bool cache_checked;
     time_t cache_request_at;
@@ -207,12 +201,6 @@ static bool request_path_is(const char *path, const char *expected)
     return strlen(expected) == length && memcmp(path, expected, length) == 0;
 }
 
-static bool is_offloaded_asset(const char *path)
-{
-    return request_path_is(path, STATIC_PREFIX "logo.png") ||
-           request_path_is(path, STATIC_PREFIX "style.css");
-}
-
 static bool prepare_response(struct http_connection *state, int length, int status)
 {
     if (length < 0 || (size_t)length >= sizeof(state->response)) {
@@ -224,28 +212,14 @@ static bool prepare_response(struct http_connection *state, int length, int stat
     return true;
 }
 
-static int submit_static_file(struct http_connection *state, struct file_pool *pool, const char *path)
-{
-    if (pool == NULL) {
-        return 404;
-    }
-    int status = file_pool_submit_open(pool, state->slot, state->connection_id,
-                                       path + sizeof(STATIC_PREFIX) - 1);
-    state->file_pending = status == 0;
-    return status;
-}
-
-static bool queue_response(struct http_connection *state, struct file_pool *pool, int status)
+static bool queue_response(struct http_connection *state, int status)
 {
     const char *body = "";
     const char *extra_headers = "";
     if (status == 200 && strcmp(state->request.method, "GET") == 0) {
         const char *path = request_path(state->request.uri);
         if (strncmp(path, STATIC_PREFIX, sizeof(STATIC_PREFIX) - 1) == 0) {
-            status = is_offloaded_asset(path) ? submit_static_file(state, pool, path) : 404;
-            if (status == 0) {
-                return true;
-            }
+            status = 404;
         } else if (request_path_is(path, "/redirect/permanent")) {
             status = 301;
             extra_headers = "Location: /\r\n";
@@ -382,7 +356,7 @@ static bool build_upstream_request(struct upstream_connection *upstream,
     return true;
 }
 
-static bool start_upstream(int queue, struct http_connection *state, struct file_pool *pool)
+static bool start_upstream(int queue, struct http_connection *state)
 {
     bool client_keep_alive = state->keep_alive;
     state->keep_alive = false;
@@ -397,41 +371,33 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
 
     const char *uri = state->request.uri;
     if (strncmp(uri, "http://", sizeof("http://") - 1) != 0) {
-        return queue_response(state, pool, 501);
+        return queue_response(state, 501);
     }
     if (is_get && state->request.content_length != 0) {
-        return queue_response(state, pool, 400);
+        return queue_response(state, 400);
     }
     char authority[sizeof("127.0.0.1:65535")];
     snprintf(authority, sizeof(authority), "%s:%d", ORIGIN_ADDRESS, state->origin_port);
     const char *host = uri + sizeof("http://") - 1;
     size_t host_length = strcspn(host, "/?");
     if (host_length != strlen(authority) || memcmp(host, authority, host_length) != 0) {
-        return queue_response(state, pool, host_length == 0 ? 400 : 403);
+        return queue_response(state, host_length == 0 ? 400 : 403);
     }
 
     struct sockaddr_in local = {0};
     socklen_t local_length = sizeof(local);
     if (getsockname(state->fd, (struct sockaddr *)&local, &local_length) == -1) {
-        return queue_response(state, pool, 500);
+        return queue_response(state, 500);
     }
     if (ntohs(local.sin_port) == state->origin_port) {
-        return queue_response(state, pool, 403);
+        return queue_response(state, 403);
     }
 
     const char *path = host + host_length;
-    if (is_get && pool != NULL && is_offloaded_asset(path)) {
-        state->keep_alive = client_keep_alive;
-        int status = submit_static_file(state, pool, path);
-        return status == 0 || queue_response(state, pool, status);
-    }
-
     if (!state->cache_checked) {
         state->cache_checked = true;
         state->cache_request_at = (time_t)-1;
-        // Keep the HTML request on the origin path when static offloading is enabled.
-        bool index_from_origin = pool != NULL && request_path_is(path, STATIC_INDEX);
-        if (is_get && !index_from_origin && !state->request.bypass_cache &&
+        if (is_get && !state->request.bypass_cache &&
             strcmp(state->request.version, "HTTP/1.1") == 0) {
             time_t now = proxy_cache_now();
             if (now >= 0) {
@@ -452,14 +418,14 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
     if (upstream == NULL) {
         upstream = calloc(1, sizeof(*upstream));
         if (upstream == NULL) {
-            return queue_response(state, pool, 500);
+            return queue_response(state, 500);
         }
         upstream->fd = -1;
         state->upstream = upstream;
         int status = open_origin(upstream, state->origin_port);
         if (status != 0) {
             close_upstream(queue, state);
-            return queue_response(state, pool, status);
+            return queue_response(state, status);
         }
     } else {
         upstream->reused = true;
@@ -473,17 +439,17 @@ static bool start_upstream(int queue, struct http_connection *state, struct file
 
     if (!build_upstream_request(upstream, &state->request, path, authority, is_post)) {
         close_upstream(queue, state);
-        return queue_response(state, pool, 500);
+        return queue_response(state, 500);
     }
     if (!set_upstream_filter(queue, state, EVFILT_WRITE) || !arm_upstream_timeout(queue, state)) {
         close_upstream(queue, state);
-        return queue_response(state, pool, 500);
+        return queue_response(state, 500);
     }
     state->keep_alive = client_keep_alive;
     return true;
 }
 
-static void reset_request(struct http_connection *state, struct file_pool *pool)
+static void reset_request(struct http_connection *state)
 {
     proxy_cache_release(state->cached.entry);
     state->cached = (struct proxy_cache_hit){0};
@@ -491,10 +457,6 @@ static void reset_request(struct http_connection *state, struct file_pool *pool)
     state->cache_checked = false;
     free(state->request.body);
     state->request = (struct http_request){0};
-    if (state->file != NULL) {
-        file_pool_release(pool, state->file);
-        state->file = NULL;
-    }
     state->header_length = 0;
     state->headers_complete = false;
     state->body_received = 0;
@@ -502,11 +464,9 @@ static void reset_request(struct http_connection *state, struct file_pool *pool)
     state->response_sent = 0;
     state->interim_response = false;
     state->keep_alive = false;
-    state->file_pending = false;
-    state->file_sent = 0;
 }
 
-static bool process_client_input(int queue, struct http_connection *state, struct file_pool *pool)
+static bool process_client_input(int queue, struct http_connection *state)
 {
     size_t consumed = 0;
     int status = read_request_bytes(state, state->input, state->input_length, &consumed);
@@ -520,17 +480,17 @@ static bool process_client_input(int queue, struct http_connection *state, struc
     if (status == 200 || status == 405) {
         if (state->request.method == NULL || state->request.uri == NULL ||
             state->request.version == NULL) {
-            return queue_response(state, pool, 500);
+            return queue_response(state, 500);
         }
         state->keep_alive = status == 200 && !state->request.connection_close &&
                             (strcmp(state->request.version, "HTTP/1.1") == 0 ||
                              state->request.connection_keep_alive);
         if (state->request.uri[0] != '/') {
-            return start_upstream(queue, state, pool);
+            return start_upstream(queue, state);
         }
     }
     close_upstream(queue, state);
-    return queue_response(state, pool, status);
+    return queue_response(state, status);
 }
 
 static void cancel_client_timeout(int queue, struct http_connection *state)
@@ -559,15 +519,15 @@ static bool arm_client_timeout(int queue, struct http_connection *state)
     return true;
 }
 
-static bool finish_response(int queue, struct http_connection *state, struct file_pool *pool)
+static bool finish_response(int queue, struct http_connection *state)
 {
     if (!state->keep_alive) {
         return false;
     }
     cancel_client_timeout(queue, state);
-    reset_request(state, pool);
+    reset_request(state);
     if (state->input_length > 0) {
-        return process_client_input(queue, state, pool);
+        return process_client_input(queue, state);
     }
     return arm_client_timeout(queue, state);
 }
@@ -585,7 +545,7 @@ static bool upstream_response_pending(const struct http_connection *client)
 }
 
 static bool send_cached_response(int queue, struct http_connection *client,
-                                 struct file_pool *pool, bool hangup)
+                                 bool hangup)
 {
     const struct proxy_cache_hit *hit = &client->cached;
     const char *data = hit->headers;
@@ -608,13 +568,13 @@ static bool send_cached_response(int queue, struct http_connection *client,
     }
     client->cached_sent += (size_t)sent;
     if (client->cached_sent == hit->header_length + client->response_length + hit->body_length) {
-        return finish_response(queue, client, pool);
+        return finish_response(queue, client);
     }
     return arm_client_timeout(queue, client);
 }
 
 static bool send_upstream_response(int queue, struct http_connection *client,
-                                   struct file_pool *pool, bool hangup)
+                                   bool hangup)
 {
     struct upstream_connection *upstream = client->upstream;
     bool sending_headers = upstream->header_sent < upstream->response.header_length;
@@ -646,39 +606,17 @@ static bool send_upstream_response(int queue, struct http_connection *client,
     } else {
         close_upstream(queue, client);
     }
-    return finish_response(queue, client, pool);
+    return finish_response(queue, client);
 }
 
-static bool send_file_chunk(int queue, struct http_connection *state, struct file_pool *pool,
-                            bool hangup)
-{
-    struct file_job *job = state->file;
-    ssize_t sent = send(state->fd, job->data + state->file_sent,
-                        job->length - state->file_sent, 0);
-    if (sent <= 0) {
-        return sent < 0 && can_retry_socket_io(hangup);
-    }
-    state->file_sent += (size_t)sent;
-    job->remaining -= (off_t)sent;
-    if (job->remaining == 0) {
-        return finish_response(queue, state, pool);
-    }
-    if (state->file_sent == job->length) {
-        state->file = NULL;
-        state->file_pending = true;
-        file_pool_submit_read(pool, job);
-    }
-    return true;
-}
-
-static bool handle_client(int queue, struct http_connection *state, struct file_pool *pool,
+static bool handle_client(int queue, struct http_connection *state,
                           bool hangup)
 {
     if (state->cached.entry != NULL) {
-        return send_cached_response(queue, state, pool, hangup);
+        return send_cached_response(queue, state, hangup);
     }
     if (state->upstream != NULL && !state->upstream->idle) {
-        return send_upstream_response(queue, state, pool, hangup);
+        return send_upstream_response(queue, state, hangup);
     }
     if (state->response_length == 0) {
         ssize_t received = recv(state->fd, state->input + state->input_length,
@@ -686,16 +624,12 @@ static bool handle_client(int queue, struct http_connection *state, struct file_
         if (received > 0) {
             cancel_client_timeout(queue, state);
             state->input_length += (size_t)received;
-            return process_client_input(queue, state, pool);
+            return process_client_input(queue, state);
         }
         if (received == 0) {
-            return state->header_length > 0 && queue_response(state, pool, 400);
+            return state->header_length > 0 && queue_response(state, 400);
         }
         return can_retry_socket_io(hangup);
-    }
-
-    if (state->response_sent == state->response_length) {
-        return send_file_chunk(queue, state, pool, hangup);
     }
 
     ssize_t sent = send(state->fd, state->response + state->response_sent,
@@ -714,17 +648,14 @@ static bool handle_client(int queue, struct http_connection *state, struct file_
         state->interim_response = false;
         return true;
     }
-    if (state->file != NULL && state->file->remaining > 0) {
-        return true;
-    }
-    return finish_response(queue, state, pool);
+    return finish_response(queue, state);
 }
 
-static void close_client(int queue, struct http_connection *client, struct file_pool *pool)
+static void close_client(int queue, struct http_connection *client)
 {
     cancel_client_timeout(queue, client);
     close_upstream(queue, client);
-    reset_request(client, pool);
+    reset_request(client);
     close(client->fd);
     client->fd = -1;
 }
@@ -761,7 +692,6 @@ static int accept_client(int server_fd, struct http_connection clients[], int or
         .fd = fd,
         .slot = slot,
         .origin_port = origin_port,
-        .connection_id = clients[slot].connection_id + 1,
         .filter = EVFILT_READ,
     };
     return slot;
@@ -774,31 +704,31 @@ static int watch_read(int queue, int fd, struct http_connection *client)
     return kevent(queue, &change, 1, NULL, 0, NULL);
 }
 
-static void fail_upstream(int queue, struct file_pool *pool, struct http_connection *client,
+static void fail_upstream(int queue, struct http_connection *client,
                           int status)
 {
     bool response_started = client->upstream->response_started;
     close_upstream(queue, client);
     client->keep_alive = false;
-    if (response_started || !queue_response(client, pool, status) ||
+    if (response_started || !queue_response(client, status) ||
         !set_client_filter(queue, client, EVFILT_WRITE)) {
-        close_client(queue, client, pool);
+        close_client(queue, client);
     }
 }
 
-static void upstream_disconnected(int queue, struct file_pool *pool, struct http_connection *client)
+static void upstream_disconnected(int queue, struct http_connection *client)
 {
     struct upstream_connection *upstream = client->upstream;
     if (!upstream->reused || upstream->raw_header_length != 0 ||
         strcmp(client->request.method, "GET") != 0) {
-        fail_upstream(queue, pool, client, 502);
+        fail_upstream(queue, client, 502);
         return;
     }
     // The origin may close just after the idle probe. Retry the GET once on a fresh socket.
     close_upstream(queue, client);
-    if (!start_upstream(queue, client, pool) ||
+    if (!start_upstream(queue, client) ||
         (client->upstream == NULL && !set_client_filter(queue, client, EVFILT_WRITE))) {
-        close_client(queue, client, pool);
+        close_client(queue, client);
     }
 }
 
@@ -877,7 +807,7 @@ static bool buffer_upstream_response(struct http_connection *client, size_t rece
     return true;
 }
 
-static void service_upstream_event(int queue, struct file_pool *pool,
+static void service_upstream_event(int queue,
                                    struct http_connection *client, const struct kevent *event)
 {
     struct upstream_connection *upstream = client->upstream;
@@ -890,13 +820,13 @@ static void service_upstream_event(int queue, struct file_pool *pool,
         return;
     }
     if (event->flags & EV_ERROR) {
-        upstream_disconnected(queue, pool, client);
+        upstream_disconnected(queue, client);
         return;
     }
     bool hangup = (event->flags & EV_EOF) != 0;
     if (event->filter == EVFILT_WRITE) {
         if (!send_upstream_request(queue, client, hangup)) {
-            upstream_disconnected(queue, pool, client);
+            upstream_disconnected(queue, client);
         }
         return;
     }
@@ -909,16 +839,16 @@ static void service_upstream_event(int queue, struct file_pool *pool,
              (!set_upstream_filter(queue, client, 0) ||
               !set_client_filter(queue, client, EVFILT_WRITE))) ||
             !arm_upstream_timeout(queue, client)) {
-            fail_upstream(queue, pool, client, 502);
+            fail_upstream(queue, client, 502);
         }
     } else if (received == 0 && upstream->response_started && !upstream->response.has_length) {
-        close_client(queue, client, pool);
+        close_client(queue, client);
     } else if (received == 0 || !can_retry_socket_io(hangup)) {
-        upstream_disconnected(queue, pool, client);
+        upstream_disconnected(queue, client);
     }
 }
 
-static void service_kqueue_client(int queue, struct file_pool *pool, const struct kevent *event)
+static void service_kqueue_client(int queue, const struct kevent *event)
 {
     struct http_connection *client = event->udata;
     if (client->fd == -1 || event->ident != (uintptr_t)client->fd ||
@@ -926,71 +856,23 @@ static void service_kqueue_client(int queue, struct file_pool *pool, const struc
         return;
     }
     bool hangup = (event->flags & EV_EOF) != 0;
-    if ((event->flags & EV_ERROR) || !handle_client(queue, client, pool, hangup)) {
-        close_client(queue, client, pool);
+    if ((event->flags & EV_ERROR) || !handle_client(queue, client, hangup)) {
+        close_client(queue, client);
         return;
     }
 
     short next_filter = EVFILT_READ;
     if (client->upstream != NULL && !client->upstream->idle) {
         next_filter = upstream_response_pending(client) ? EVFILT_WRITE : 0;
-    } else if (client->file_pending) {
-        next_filter = 0;
     } else if (client->response_length > 0) {
         next_filter = EVFILT_WRITE;
     }
     if (!set_client_filter(queue, client, next_filter)) {
-        close_client(queue, client, pool);
+        close_client(queue, client);
     }
 }
 
-static bool finish_file_job(struct http_connection *client, struct file_pool *pool,
-                            struct file_job *job)
-{
-    client->file_pending = false;
-    if (job->status != 200) {
-        int status = job->status;
-        file_pool_release(pool, job);
-        // Once the headers have been sent, a failed read ends the response.
-        return client->response_length == 0 && queue_response(client, pool, status);
-    }
-
-    client->file = job;
-    client->file_sent = 0;
-    if (client->response_length > 0) {
-        return true;
-    }
-    int length = http_write_file_headers(client->response, sizeof(client->response),
-                                        client->request.version, job->content_type,
-                                        (uintmax_t)job->remaining, "", client->keep_alive);
-    return prepare_response(client, length, 200);
-}
-
-static bool service_file_completions(int queue, struct file_pool *pool,
-                                     struct http_connection clients[])
-{
-    if (file_pool_drain_notifications(pool) == -1) {
-        perror("read: file completion");
-        return false;
-    }
-
-    struct file_job *job;
-    while ((job = file_pool_take_completed(pool)) != NULL) {
-        struct http_connection *client = &clients[job->slot];
-        if (client->fd == -1 || client->connection_id != job->connection_id ||
-            !client->file_pending) {
-            file_pool_release(pool, job);
-            continue;
-        }
-        if (!finish_file_job(client, pool, job) ||
-            !set_client_filter(queue, client, EVFILT_WRITE)) {
-            close_client(queue, client, pool);
-        }
-    }
-    return true;
-}
-
-static int run_server(int server_fd, struct file_pool *pool, int origin_port)
+static int run_server(int server_fd, int origin_port)
 {
     int queue = kqueue();
     if (queue == -1) {
@@ -1022,16 +904,6 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
         close(queue);
         return 1;
     }
-    int notification_fd = -1;
-    if (pool != NULL) {
-        notification_fd = file_pool_notification_fd(pool);
-        if (watch_read(queue, notification_fd, NULL) == -1) {
-            perror("kevent: watch file completion");
-            close(queue);
-            return 1;
-        }
-    }
-
     struct http_connection *clients = calloc(MAX_CLIENTS, sizeof(*clients));
     if (clients == NULL) {
         perror("calloc: client slots");
@@ -1065,11 +937,11 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
                 struct http_connection *client = event->udata;
                 if (event->ident >= MAX_CLIENTS) {
                     if (client->upstream != NULL && !client->upstream->idle) {
-                        fail_upstream(queue, pool, client, 504);
+                        fail_upstream(queue, client, 504);
                     }
                 } else if (client->client_timer) {
                     client->client_timer = false;
-                    close_client(queue, client, pool);
+                    close_client(queue, client);
                 }
             }
         }
@@ -1082,20 +954,12 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
             }
             if (event->ident == (uintptr_t)server_fd) {
                 listener = event;
-            } else if (event->ident == (uintptr_t)notification_fd) {
-                if (event->flags & EV_ERROR) {
-                    fputs("File completion pipe failed\n", stderr);
-                    goto close_connections;
-                }
-                if (!service_file_completions(queue, pool, clients)) {
-                    goto close_connections;
-                }
             } else {
                 struct http_connection *client = event->udata;
                 if (client->upstream != NULL && event->ident == (uintptr_t)client->upstream->fd) {
-                    service_upstream_event(queue, pool, client, event);
+                    service_upstream_event(queue, client, event);
                 } else {
-                    service_kqueue_client(queue, pool, event);
+                    service_kqueue_client(queue, event);
                 }
             }
         }
@@ -1119,7 +983,7 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
             }
             if (watch_read(queue, clients[slot].fd, &clients[slot]) == -1) {
                 perror("kevent: watch client");
-                close_client(queue, &clients[slot], pool);
+                close_client(queue, &clients[slot]);
             }
         }
     }
@@ -1127,7 +991,7 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
 close_connections:
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd != -1) {
-            close_client(queue, &clients[i], pool);
+            close_client(queue, &clients[i]);
         }
     }
     proxy_cache_destroy();
@@ -1155,8 +1019,8 @@ int main(int argc, char *argv[])
             origin_port = (int)requested;
         }
     }
-    if (option != -1 || argc - optind > 1) {
-        fprintf(stderr, "Usage: %s [-p port] [-o destination-port] [static-root]\n", argv[0]);
+    if (option != -1 || optind != argc) {
+        fprintf(stderr, "Usage: %s [-p port] [-o destination-port]\n", argv[0]);
         return 1;
     }
 
@@ -1204,32 +1068,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int root_fd = -1;
-    struct file_pool *pool = NULL;
-    if (optind < argc) {
-        const char *root = argv[optind];
-        root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (root_fd == -1) {
-            perror(root);
-            close(server_fd);
-            return 1;
-        }
-        pool = file_pool_create(root_fd, MAX_CLIENTS);
-        if (pool == NULL) {
-            perror("file worker pool");
-            close(root_fd);
-            close(server_fd);
-            return 1;
-        }
-    }
-
     printf("HTTP server listening on http://127.0.0.1:%d\n", port);
 
-    int result = run_server(server_fd, pool, origin_port);
-    if (pool != NULL) {
-        file_pool_destroy(pool);
-        close(root_fd);
-    }
+    int result = run_server(server_fd, origin_port);
     close(server_fd);
     return result;
 }
