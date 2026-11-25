@@ -22,10 +22,11 @@ enum {
     DEFAULT_STATIC_PORT = 9000,
     DEFAULT_CGI_PORT = 9001,
     MAX_BACKENDS = 16,
+    MAX_IDLE_PER_BACKEND = 8,
     MAX_ROUTES = 16,
     MAX_CLIENTS = 10000,
     ACCEPT_BATCH_SIZE = 64,
-    MAX_EVENTS = MAX_CLIENTS * 3 + MAX_BACKENDS + 6,
+    MAX_EVENTS = MAX_CLIENTS * 3 + MAX_BACKENDS * (MAX_IDLE_PER_BACKEND + 1) + 6,
     BUFFER_SIZE = 4096,
     ORIGIN_AUTH_HEADER_CAPACITY = sizeof(HTTP_ORIGIN_TOKEN_HEADER ": \r\n") + HTTP_ORIGIN_TOKEN_LENGTH,
     CLIENT_TIMEOUT_MS = 5000,
@@ -49,6 +50,8 @@ struct backend_target {
     int port;
     bool healthy;
     struct health_probe probe;
+    int idle_fds[MAX_IDLE_PER_BACKEND];
+    size_t idle_count;
 };
 
 struct backend_group {
@@ -61,7 +64,7 @@ struct proxy_route {
     const char *path;
     size_t path_length;
     struct backend_group backends;
-    const struct backend_target *standby;
+    struct backend_target *standby;
 };
 
 struct backend_pool {
@@ -76,9 +79,10 @@ struct backend_pool {
 
 struct backend_connection {
     int fd;
-    int port;
+    struct backend_target *target;
     short filter;
     bool connecting;
+    bool reused;
     bool response_started;
     char request_headers[HTTP_MAX_HEADERS + 128 + ORIGIN_AUTH_HEADER_CAPACITY];
     size_t request_header_length;
@@ -118,6 +122,7 @@ struct http_connection {
 
 static bool set_backend_filter(int queue, struct http_connection *client, short next);
 static bool arm_timeout(int queue, struct http_connection *client);
+static int watch_read(int queue, int fd, struct http_connection *client);
 
 static void handle_stop_signal(int signal_number)
 {
@@ -236,21 +241,21 @@ static struct proxy_route *find_route(struct backend_pool *pool, const char *pat
     return NULL;
 }
 
-static int next_backend(struct backend_pool *pool, const char *uri)
+static struct backend_target *next_backend(struct backend_pool *pool, const char *uri)
 {
     struct proxy_route *route = find_route(pool, uri, strcspn(uri, "?"));
     struct backend_group *group = route == NULL ? &pool->fallback : &route->backends;
     for (size_t i = 0; i < group->count; i++) {
-        const struct backend_target *target = &pool->targets[group->indices[group->next]];
+        struct backend_target *target = &pool->targets[group->indices[group->next]];
         group->next = (group->next + 1) % group->count;
         if (pool->health_interval_ms == 0 || target->healthy) {
-            return target->port;
+            return target;
         }
     }
     if (route != NULL && route->standby != NULL && route->standby->healthy) {
-        return route->standby->port;
+        return route->standby;
     }
-    return 0;
+    return NULL;
 }
 
 static bool replaced_request_header(const char *name, size_t length)
@@ -275,8 +280,8 @@ static bool build_backend_request(const struct http_connection *client,
     char *output = backend->request_headers;
     size_t capacity = sizeof(backend->request_headers);
     int length = snprintf(output, capacity,
-                          "%s %s %s\r\nHost: 127.0.0.1:%d\r\nContent-Length: %zu\r\nConnection: close\r\n%s",
-                          request->method, request->uri, request->version, backend->port,
+                          "%s %s %s\r\nHost: 127.0.0.1:%d\r\nContent-Length: %zu\r\nConnection: keep-alive\r\n%s",
+                          request->method, request->uri, request->version, backend->target->port,
                           request->content_length, client->origins->origin_auth_header);
     if (length < 0 || (size_t)length >= capacity) {
         return false;
@@ -367,29 +372,92 @@ static bool is_offloaded_asset(const char *uri)
 static void close_backend(struct http_connection *client)
 {
     if (client->backend != NULL) {
-        close(client->backend->fd);
+        if (client->backend->fd != -1) {
+            close(client->backend->fd);
+        }
         free(client->backend);
         client->backend = NULL;
     }
 }
 
+static int take_idle_backend(struct backend_target *target)
+{
+    while (target->idle_count > 0) {
+        int fd = target->idle_fds[--target->idle_count];
+        char byte;
+        ssize_t received;
+        do {
+            received = recv(fd, &byte, sizeof(byte), MSG_PEEK);
+        } while (received == -1 && errno == EINTR);
+        // A reusable socket has neither unread response data nor an EOF.
+        if (received == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return fd;
+        }
+        close(fd);
+    }
+    return -1;
+}
+
+static void release_backend(int queue, struct http_connection *client)
+{
+    struct backend_connection *backend = client->backend;
+    if (backend == NULL) {
+        return;
+    }
+    struct backend_target *target = backend->target;
+    if (backend->response.origin_keep_alive && backend->response.remaining == 0 &&
+        (client->origins->health_interval_ms == 0 || target->healthy) &&
+        target->idle_count < MAX_IDLE_PER_BACKEND &&
+        watch_read(queue, backend->fd, NULL) == 0) {
+        target->idle_fds[target->idle_count++] = backend->fd;
+        backend->fd = -1;
+    }
+    close_backend(client);
+}
+
+static void close_idle_backends(struct backend_target *target)
+{
+    while (target->idle_count > 0) {
+        close(target->idle_fds[--target->idle_count]);
+    }
+}
+
+static bool discard_idle_backend(struct backend_target *target, uintptr_t ident)
+{
+    for (size_t i = 0; i < target->idle_count; i++) {
+        int fd = target->idle_fds[i];
+        if ((uintptr_t)fd == ident) {
+            target->idle_fds[i] = target->idle_fds[--target->idle_count];
+            close(fd);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool start_backend(int queue, struct http_connection *client)
 {
-    int port = next_backend(client->origins, client->request.uri);
-    if (port == 0) {
+    struct backend_target *target = next_backend(client->origins, client->request.uri);
+    if (target == NULL) {
         return queue_response(client, 503);
     }
     struct backend_connection *backend = calloc(1, sizeof(*backend));
     if (backend == NULL) {
         return queue_response(client, 500);
     }
-    backend->port = port;
+    backend->target = target;
     if (!build_backend_request(client, backend)) {
         free(backend);
         return queue_response(client, 500);
     }
 
-    backend->fd = connect_backend(backend->port, &backend->connecting);
+    backend->fd = take_idle_backend(target);
+    if (backend->fd != -1) {
+        backend->filter = EVFILT_READ;
+        backend->reused = true;
+    } else {
+        backend->fd = connect_backend(target->port, &backend->connecting);
+    }
     if (backend->fd == -1) {
         free(backend);
         return queue_response(client, 502);
@@ -485,7 +553,7 @@ static bool arm_timeout(int queue, struct http_connection *state)
 
 static bool finish_response(int queue, struct http_connection *state)
 {
-    close_backend(state);
+    release_backend(queue, state);
     if (!state->keep_alive) {
         return false;
     }
@@ -694,6 +762,9 @@ static void finish_health_probe(struct backend_target *target, bool healthy)
     close(target->probe.fd);
     target->probe.fd = -1;
     target->healthy = healthy;
+    if (!healthy) {
+        close_idle_backends(target);
+    }
 }
 
 static void expire_health_probes(struct backend_pool *pool)
@@ -813,7 +884,28 @@ static void fail_backend(int queue, struct http_connection *client, int status)
     }
 }
 
-static bool send_backend_request(int queue, struct http_connection *client, bool hangup)
+static void backend_disconnected(int queue, struct http_connection *client)
+{
+    struct backend_connection *backend = client->backend;
+    if (!backend->reused || backend->raw_header_length != 0 ||
+        (backend->request_sent != 0 && strcmp(client->request.method, "GET") != 0)) {
+        fail_backend(queue, client, 502);
+        return;
+    }
+
+    // An idle socket can close between the peek and the request.
+    close(backend->fd);
+    backend->fd = connect_backend(backend->target->port, &backend->connecting);
+    backend->filter = 0;
+    backend->reused = false;
+    backend->request_sent = 0;
+    if (backend->fd == -1 || !set_backend_filter(queue, client, EVFILT_WRITE) ||
+        !arm_timeout(queue, client)) {
+        fail_backend(queue, client, 502);
+    }
+}
+
+static bool send_backend_request(int queue, struct http_connection *client)
 {
     struct backend_connection *backend = client->backend;
     if (backend->connecting) {
@@ -838,7 +930,7 @@ static bool send_backend_request(int queue, struct http_connection *client, bool
     }
     ssize_t sent = send(backend->fd, data, length, 0);
     if (sent <= 0) {
-        return sent < 0 && can_retry_socket_io(hangup);
+        return sent < 0 && can_retry_socket_io(false);
     }
     backend->request_sent += (size_t)sent;
     size_t request_length = backend->request_header_length + client->request.content_length;
@@ -852,7 +944,7 @@ static bool tag_backend_response(struct backend_connection *backend)
     size_t offset = response->header_length - 2;
     size_t space = sizeof(response->headers) - offset;
     int length = snprintf(response->headers + offset, space,
-                          "X-Backend-Port: %d\r\n\r\n", backend->port);
+                          "X-Backend-Port: %d\r\n\r\n", backend->target->port);
     if (length < 0 || (size_t)length >= space) {
         return false;
     }
@@ -899,13 +991,13 @@ static void service_backend_event(int queue, struct http_connection *client,
         return;
     }
     if (event->flags & EV_ERROR) {
-        fail_backend(queue, client, 502);
+        backend_disconnected(queue, client);
         return;
     }
     bool hangup = (event->flags & EV_EOF) != 0;
     if (event->filter == EVFILT_WRITE) {
-        if (!send_backend_request(queue, client, hangup)) {
-            fail_backend(queue, client, 502);
+        if (hangup || !send_backend_request(queue, client)) {
+            backend_disconnected(queue, client);
         }
         return;
     }
@@ -922,7 +1014,7 @@ static void service_backend_event(int queue, struct http_connection *client,
     } else if (received == 0 && backend->response_started && !backend->response.has_length) {
         close_client(queue, client);
     } else if (received == 0 || !can_retry_socket_io(hangup)) {
-        fail_backend(queue, client, 502);
+        backend_disconnected(queue, client);
     }
 }
 
@@ -1119,6 +1211,9 @@ static int run_server(int server_fd, struct backend_pool *origins, struct file_p
                         service_health_event(queue, target, event);
                         break;
                     }
+                    if (discard_idle_backend(target, event->ident)) {
+                        break;
+                    }
                 }
             } else {
                 struct http_connection *client = event->udata;
@@ -1162,6 +1257,9 @@ static int run_server(int server_fd, struct backend_pool *origins, struct file_p
 
 close_connections:
     expire_health_probes(origins);
+    for (size_t i = 0; i < origins->count; i++) {
+        close_idle_backends(&origins->targets[i]);
+    }
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd != -1) {
             close_client(queue, &clients[i]);
