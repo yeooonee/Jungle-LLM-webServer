@@ -5,9 +5,9 @@ CGI_PROGS = $(patsubst cgi-src/%.c,build/cgi-bin/%,$(wildcard cgi-src/*.c))
 
 all: build/server build/server_copy $(CGI_PROGS)
 
-SRCS = src/main.c src/http.c src/static.c src/cgi.c src/pool.c
+SRCS = src/main.c src/http.c src/static.c src/cgi.c src/pool.c src/proxy.c
 
-build/server: $(SRCS) src/http.h src/static.h src/cgi.h src/pool.h
+build/server: $(SRCS) src/http.h src/static.h src/cgi.h src/pool.h src/proxy.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -pthread -o $@ $(SRCS)
 
