@@ -22,6 +22,7 @@ static struct {
   size_t started;
   int root_fd;
   const char *cgi_program;
+  proxy_routes *routes;
   int cancel_pipe[2];
   int stopping;
 } pool;
@@ -45,7 +46,7 @@ static void *worker(void *argument) {
     worker->client_fd = client_fd;
     pthread_mutex_unlock(&pool.mutex);
 
-    int result = tcp_handle_client(client_fd, pool.root_fd, pool.cgi_program,
+    int result = tcp_handle_client(client_fd, pool.root_fd, pool.cgi_program, pool.routes,
                                      pool.cancel_pipe[0], &not_stopping);
     int error = errno;
     pthread_mutex_lock(&pool.mutex);
@@ -101,6 +102,7 @@ void dispatch_stop(void) {
 }
 
 int dispatch_start(int root_fd, const char *cgi_program,
+                     proxy_routes *routes,
                      const volatile sig_atomic_t *stopping) {
   (void)stopping;
   pool.head = 0;
@@ -109,6 +111,7 @@ int dispatch_start(int root_fd, const char *cgi_program,
   pool.stopping = 0;
   pool.root_fd = root_fd;
   pool.cgi_program = cgi_program;
+  pool.routes = routes;
   for (size_t i = 0; i < THREAD_POOL_WORKERS; ++i) {
     pool.workers[i].client_fd = -1;
   }

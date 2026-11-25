@@ -19,12 +19,16 @@ static const char *reason_phrase(int status) {
     return "Not Found";
   case 413:
     return "Content Too Large";
+  case 431:
+    return "Request Header Fields Too Large";
   case 501:
     return "Not Implemented";
   case 502:
     return "Bad Gateway";
   case 504:
     return "Gateway Timeout";
+  case 505:
+    return "HTTP Version Not Supported";
   case 500:
     return "Internal Server Error";
   default:
@@ -45,9 +49,9 @@ static int valid_content_type(const char *value) {
   return 1;
 }
 
-static int format_headers(const http_response *response, char *headers,
+int http_response_format_headers(const http_response *response, char *headers,
                            size_t capacity) {
-  if (response == NULL || !valid_content_type(response->content_type)) {
+  if (headers == NULL || capacity == 0 || response == NULL || !valid_content_type(response->content_type)) {
     errno = EINVAL;
     return -1;
   }
@@ -82,7 +86,7 @@ int http_response_validate(const http_response *response) {
     return -1;
   }
   char headers[1024];
-  return format_headers(response, headers, sizeof(headers)) < 0 ? -1 : 0;
+  return http_response_format_headers(response, headers, sizeof(headers)) < 0 ? -1 : 0;
 }
 
 int http_response_send_headers(int client_fd, const http_response *response,
@@ -92,7 +96,7 @@ int http_response_send_headers(int client_fd, const http_response *response,
     return -1;
   }
   char headers[1024];
-  int length = format_headers(response, headers, sizeof(headers));
+  int length = http_response_format_headers(response, headers, sizeof(headers));
   if (length < 0) {
     return -1;
   }

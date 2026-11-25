@@ -118,9 +118,11 @@ int main(void) {
   check_response(400, "Bad Request", "bad request", 11);
   check_response(403, "Forbidden", "forbidden", 9);
   check_response(404, "Not Found", "not found", 9);
+  check_response(431, "Request Header Fields Too Large", "headers", 7);
   check_response(500, "Internal Server Error", "error", 5);
   check_response(502, "Bad Gateway", "bad gateway", 11);
   check_response(504, "Gateway Timeout", "timeout", 7);
+  check_response(505, "HTTP Version Not Supported", "version", 7);
   check_response(200, "OK", NULL, 0);
   const char binary[] = {'a', '\0', '\xff', '\r', '\n'};
   check_response(200, "OK", binary, sizeof(binary));
@@ -147,6 +149,12 @@ int main(void) {
 
   stopping = 1;
   http_response response = {200, "text/plain", NULL, 0};
+  char formatted[256];
+  int formatted_length = http_response_format_headers(&response, formatted, sizeof(formatted));
+  assert(formatted_length > 0 && (size_t)formatted_length == strlen(formatted));
+  assert(strstr(formatted, "Content-Length: 0\r\n") != NULL);
+  assert(http_response_format_headers(&response, NULL, 0) == -1 && errno == EINVAL);
+  assert(http_response_format_headers(&response, formatted, 1) == -1 && errno == EMSGSIZE);
   check_invalid(&response, ECANCELED);
   stopping = 0;
 

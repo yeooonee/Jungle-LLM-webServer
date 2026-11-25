@@ -6,6 +6,9 @@
 #include "http/request.h"
 #include "http/response.h"
 #include "static/file.h"
+#include "proxy/route.h"
+
+#define PROXY_REQUEST_TIMEOUT_MS 3000
 
 #include <errno.h>
 #include <fcntl.h>
@@ -44,8 +47,8 @@ int tcp_send_all(int socket_fd, const void *data, size_t length,
 }
 
 int tcp_handle_client(int client_fd, int root_fd, const char *cgi_program,
-                       int cancel_fd,
-                         const volatile sig_atomic_t *stopping) {
+                       proxy_routes *routes, int cancel_fd,
+                       const volatile sig_atomic_t *stopping) {
   struct timeval timeout = {.tv_sec = 0, .tv_usec = 250000};
   if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                  sizeof(timeout)) == -1) {
@@ -74,7 +77,25 @@ int tcp_handle_client(int client_fd, int root_fd, const char *cgi_program,
     http_parse_result parsed = http_request_parse(buffer, used, &request);
     if (parsed == HTTP_PARSE_INCOMPLETE && count > 0 && used < capacity)
       continue;
-    if (parsed == HTTP_PARSE_COMPLETE && request.method.length == 3 &&
+    proxy_route *route = parsed == HTTP_PARSE_COMPLETE
+                                  ? proxy_route_select(routes, request.target) : NULL;
+    if (route != NULL) {
+      if (request.version.length == 8 && memcmp(request.version.data, "HTTP/1.1", 8) == 0) {
+        const proxy_backend *backend = proxy_backend_next(route);
+        if (backend == NULL) {
+          const char body[] = "Internal Server Error\n";
+          http_response response = {500, "text/plain", body, sizeof(body) - 1};
+          result = http_response_send(client_fd, &response, stopping);
+        } else {
+          result = proxy_forward_request(client_fd, &request, backend, PROXY_REQUEST_TIMEOUT_MS,
+                                           stopping, cancel_fd);
+        }
+      } else {
+        const char body[] = "HTTP Version Not Supported\n";
+        http_response response = {505, "text/plain; charset=utf-8", body, sizeof(body) - 1};
+        result = http_response_send(client_fd, &response, stopping);
+      }
+    } else if (parsed == HTTP_PARSE_COMPLETE && request.method.length == 3 &&
         memcmp(request.method.data, "GET", 3) == 0) {
       result = static_file_send(client_fd, root_fd, request.target, stopping);
     } else if (parsed == HTTP_PARSE_COMPLETE && request.method.length == 4 &&
@@ -112,6 +133,7 @@ int tcp_handle_client(int client_fd, int root_fd, const char *cgi_program,
 }
 
 int tcp_http_server(unsigned short port, const char *root, const char *cgi_program,
+                    proxy_routes *routes,
                     const volatile sig_atomic_t *stopping) {
   int root_fd = open(root, O_RDONLY | O_DIRECTORY);
   if (root_fd == -1) {
@@ -159,7 +181,7 @@ int tcp_http_server(unsigned short port, const char *root, const char *cgi_progr
     goto cleanup;
   }
 
-  if (dispatch_start(root_fd, cgi_program, stopping) == -1) {
+  if (dispatch_start(root_fd, cgi_program, routes, stopping) == -1) {
     perror("dispatch_start");
     goto cleanup;
   }

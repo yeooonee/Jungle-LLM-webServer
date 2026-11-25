@@ -111,6 +111,7 @@ test-integration: $(TARGET) $(CGI_TARGET)
 	python3 tests/integration/test_static.py $(TARGET)
 	python3 tests/integration/test_concurrency.py $(TARGET) $(CONCURRENCY)
 	python3 tests/integration/test_cgi_http.py $(TARGET) $(CGI_TARGET) $(CONCURRENCY)
+	python3 tests/integration/test_proxy_http.py $(TARGET) $(CGI_TARGET)
 
 help:
 	@echo "CONCURRENCY=threadpool (default) or sequential"
@@ -121,7 +122,7 @@ help:
 	@echo "  make test     Build and run unit tests in tests/unit/"
 	@echo "  make cgi      Build CGI program and learning launcher ($(CGI_TARGET))"
 	@echo "  make test-cgi Run standalone CGI checks (Python 3 required)"
-	@echo "  make test-integration  Run HTTP, concurrency and CGI checks (Python 3 required)"
+	@echo "  make test-integration  Run HTTP, concurrency, CGI and proxy checks (Python 3 required)"
 	@echo "  make clean    Remove build artifacts"
 
 -include $(DEPS)
