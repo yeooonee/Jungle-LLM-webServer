@@ -22,7 +22,8 @@ enum {
     DEFAULT_CGI_PORT = 9001,
     MAX_BACKENDS = 16,
     MAX_ROUTES = 16,
-    MAX_CLIENTS = 64,
+    MAX_CLIENTS = 10000,
+    ACCEPT_BATCH_SIZE = 64,
     MAX_EVENTS = MAX_CLIENTS * 3 + MAX_BACKENDS + 5,
     BUFFER_SIZE = 4096,
     ORIGIN_AUTH_HEADER_CAPACITY = sizeof(HTTP_ORIGIN_TOKEN_HEADER ": \r\n") + HTTP_ORIGIN_TOKEN_LENGTH,
@@ -131,6 +132,7 @@ static int connect_backend(int port, bool *connecting)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
+        perror("open backend socket");
         return -1;
     }
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(port)};
@@ -141,6 +143,7 @@ static int connect_backend(int port, bool *connecting)
     *connecting = false;
     if (connect(fd, (struct sockaddr *)&address, sizeof(address)) == -1) {
         if (errno != EINPROGRESS && errno != EINTR) {
+            fprintf(stderr, "connect to backend port %d: %s\n", port, strerror(errno));
             close(fd);
             return -1;
         }
@@ -912,7 +915,12 @@ static int run_server(int server_fd, struct backend_pool *origins)
         close(queue);
         return 1;
     }
-    struct http_connection clients[MAX_CLIENTS] = {0};
+    struct http_connection *clients = calloc(MAX_CLIENTS, sizeof(*clients));
+    if (clients == NULL) {
+        perror("calloc: client slots");
+        close(queue);
+        return 1;
+    }
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
     }
@@ -1005,11 +1013,14 @@ static int run_server(int server_fd, struct backend_pool *origins)
             break;
         }
 
-        int slot = accept_client(server_fd, clients, origins);
-        if (slot == ACCEPT_FAILED) {
-            break;
-        }
-        if (slot >= 0) {
+        for (int i = 0; i < ACCEPT_BATCH_SIZE; i++) {
+            int slot = accept_client(server_fd, clients, origins);
+            if (slot == ACCEPT_FAILED) {
+                goto close_connections;
+            }
+            if (slot == ACCEPT_RETRY) {
+                break;
+            }
             struct http_connection *client = &clients[slot];
             if (watch_read(queue, client->fd, client) == -1) {
                 perror("kevent: watch client");
@@ -1028,6 +1039,7 @@ close_connections:
         }
     }
     close(queue);
+    free(clients);
     return exit_status;
 }
 
@@ -1227,7 +1239,7 @@ int main(int argc, char *argv[])
         close(server_fd);
         return 1;
     }
-    if (listen(server_fd, 8) == -1) {
+    if (listen(server_fd, MAX_CLIENTS) == -1) {
         perror("listen");
         close(server_fd);
         return 1;

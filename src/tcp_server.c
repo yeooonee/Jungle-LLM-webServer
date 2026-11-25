@@ -17,7 +17,8 @@
 #include <unistd.h>
 
 enum {
-    MAX_CLIENTS = 64,
+    MAX_CLIENTS = 10000,
+    ACCEPT_BATCH_SIZE = 64,
     MAX_EVENTS = MAX_CLIENTS * 2 + 5,
     BUFFER_SIZE = 4096,
     KEEP_ALIVE_TIMEOUT_MS = 5000
@@ -695,7 +696,12 @@ static int run_server(int server_fd, struct file_pool *pool, const char *origin_
         }
     }
 
-    struct http_connection clients[MAX_CLIENTS] = {0};
+    struct http_connection *clients = calloc(MAX_CLIENTS, sizeof(*clients));
+    if (clients == NULL) {
+        perror("calloc: client slots");
+        close(queue);
+        return 1;
+    }
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
     }
@@ -761,13 +767,18 @@ static int run_server(int server_fd, struct file_pool *pool, const char *origin_
             break;
         }
 
-        int slot = accept_client(server_fd, clients, origin_token);
-        if (slot == ACCEPT_FAILED) {
-            break;
-        }
-        if (slot >= 0 && watch_read(queue, clients[slot].fd, &clients[slot]) == -1) {
-            perror("kevent: watch client");
-            close_client(queue, &clients[slot], pool);
+        for (int i = 0; i < ACCEPT_BATCH_SIZE; i++) {
+            int slot = accept_client(server_fd, clients, origin_token);
+            if (slot == ACCEPT_FAILED) {
+                goto close_connections;
+            }
+            if (slot == ACCEPT_RETRY) {
+                break;
+            }
+            if (watch_read(queue, clients[slot].fd, &clients[slot]) == -1) {
+                perror("kevent: watch client");
+                close_client(queue, &clients[slot], pool);
+            }
         }
     }
 
@@ -778,6 +789,7 @@ close_connections:
         }
     }
     close(queue);
+    free(clients);
     pid_t child;
     do {
         child = waitpid(-1, NULL, 0);
@@ -848,7 +860,7 @@ int main(int argc, char *argv[])
         close(server_fd);
         return 1;
     }
-    if (listen(server_fd, 8) == -1) {
+    if (listen(server_fd, MAX_CLIENTS) == -1) {
         perror("listen");
         close(server_fd);
         return 1;

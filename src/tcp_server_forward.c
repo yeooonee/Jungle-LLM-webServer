@@ -19,7 +19,8 @@
 enum {
     LISTEN_PORT = 9100,
     DEFAULT_ORIGIN_PORT = 9000,
-    MAX_CLIENTS = 64,
+    MAX_CLIENTS = 10000,
+    ACCEPT_BATCH_SIZE = 64,
     MAX_EVENTS = MAX_CLIENTS * 3 + 4,
     BUFFER_SIZE = 4096,
     CLIENT_TIMEOUT_MS = 5000,
@@ -328,10 +329,12 @@ static int open_origin(struct upstream_connection *upstream, int port)
     }
     upstream->fd = socket(AF_INET, SOCK_STREAM, 0);
     if (upstream->fd == -1 || configure_socket(upstream->fd) == -1) {
+        perror("open upstream socket");
         return 502;
     }
     if (connect(upstream->fd, (struct sockaddr *)&origin, sizeof(origin)) == -1) {
         if (errno != EINPROGRESS && errno != EINTR) {
+            fprintf(stderr, "connect to upstream port %d: %s\n", port, strerror(errno));
             return 502;
         }
         upstream->connecting = true;
@@ -805,7 +808,12 @@ static bool send_upstream_request(int queue, struct http_connection *client, boo
     if (upstream->connecting) {
         int error;
         socklen_t length = sizeof(error);
-        if (getsockopt(upstream->fd, SOL_SOCKET, SO_ERROR, &error, &length) == -1 || error != 0) {
+        if (getsockopt(upstream->fd, SOL_SOCKET, SO_ERROR, &error, &length) == -1) {
+            perror("getsockopt: upstream connection");
+            return false;
+        }
+        if (error != 0) {
+            fprintf(stderr, "upstream connection: %s\n", strerror(error));
             return false;
         }
         upstream->connecting = false;
@@ -1024,7 +1032,12 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
         }
     }
 
-    struct http_connection clients[MAX_CLIENTS] = {0};
+    struct http_connection *clients = calloc(MAX_CLIENTS, sizeof(*clients));
+    if (clients == NULL) {
+        perror("calloc: client slots");
+        close(queue);
+        return 1;
+    }
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].fd = -1;
     }
@@ -1096,13 +1109,18 @@ static int run_server(int server_fd, struct file_pool *pool, int origin_port)
             break;
         }
 
-        int slot = accept_client(server_fd, clients, origin_port);
-        if (slot == ACCEPT_FAILED) {
-            break;
-        }
-        if (slot >= 0 && watch_read(queue, clients[slot].fd, &clients[slot]) == -1) {
-            perror("kevent: watch client");
-            close_client(queue, &clients[slot], pool);
+        for (int i = 0; i < ACCEPT_BATCH_SIZE; i++) {
+            int slot = accept_client(server_fd, clients, origin_port);
+            if (slot == ACCEPT_FAILED) {
+                goto close_connections;
+            }
+            if (slot == ACCEPT_RETRY) {
+                break;
+            }
+            if (watch_read(queue, clients[slot].fd, &clients[slot]) == -1) {
+                perror("kevent: watch client");
+                close_client(queue, &clients[slot], pool);
+            }
         }
     }
 
@@ -1114,6 +1132,7 @@ close_connections:
     }
     proxy_cache_destroy();
     close(queue);
+    free(clients);
     return exit_status;
 }
 
@@ -1179,7 +1198,7 @@ int main(int argc, char *argv[])
         close(server_fd);
         return 1;
     }
-    if (listen(server_fd, 8) == -1) {
+    if (listen(server_fd, MAX_CLIENTS) == -1) {
         perror("listen");
         close(server_fd);
         return 1;
