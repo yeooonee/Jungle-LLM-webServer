@@ -13,6 +13,7 @@
 #include "http.h"
 #include "cgi.h"
 #include "pool.h"
+#include "proxy.h"
 #include "static.h"
 
 #define BACKLOG 10   // listen 대기열 길이
@@ -30,8 +31,11 @@ static struct {
     char queue_size[16];
     char read_timeout[16];
     char request_timeout[16];
+    char backend_connect_timeout[16];
+    char backend_read_timeout[16];
+    char backend_max_response[16];
 } conf = { "8080", "./www", "./mime.types", "./build/cgi-bin", "5", "1048576", "./cgi.log",
-           "8", "16", "5", "10" };
+           "8", "16", "5", "10", "2", "5", "1048576" };
 
 // 숫자 설정값 검사. strtol: end = 숫자 다음 글자 위치. "80abc"면 end가 'a'를 가리킴 → 거절
 static long to_long(const char *s, long min, long max, const char *name) {
@@ -54,6 +58,11 @@ static void load_config(const char *path) {
         if (hash) *hash = '\0';
         int got = sscanf(line, "%31s %4095s", key, value);
         if (got <= 0) continue;                                    // 빈 줄·주석
+        // route는 값이 여러 개 (접두사 + 백엔드들) → 키 뒤 나머지를 통째로 넘김
+        if (!strcmp(key, "route")) {
+            if (proxy_add_route(strstr(line, "route") + 5) < 0) { fprintf(stderr, "%s:%d: bad route\n", path, no); exit(1); }
+            continue;
+        }
         if (got == 2 && !strcmp(key, "port"))            snprintf(conf.port, sizeof(conf.port), "%s", value);
         else if (got == 2 && !strcmp(key, "root"))       snprintf(conf.root, sizeof(conf.root), "%s", value);
         else if (got == 2 && !strcmp(key, "mime_types")) snprintf(conf.mime_types, sizeof(conf.mime_types), "%s", value);
@@ -65,6 +74,9 @@ static void load_config(const char *path) {
         else if (got == 2 && !strcmp(key, "queue_size")) snprintf(conf.queue_size, sizeof(conf.queue_size), "%s", value);
         else if (got == 2 && !strcmp(key, "read_timeout")) snprintf(conf.read_timeout, sizeof(conf.read_timeout), "%s", value);
         else if (got == 2 && !strcmp(key, "request_timeout")) snprintf(conf.request_timeout, sizeof(conf.request_timeout), "%s", value);
+        else if (got == 2 && !strcmp(key, "backend_connect_timeout")) snprintf(conf.backend_connect_timeout, sizeof(conf.backend_connect_timeout), "%s", value);
+        else if (got == 2 && !strcmp(key, "backend_read_timeout")) snprintf(conf.backend_read_timeout, sizeof(conf.backend_read_timeout), "%s", value);
+        else if (got == 2 && !strcmp(key, "backend_max_response")) snprintf(conf.backend_max_response, sizeof(conf.backend_max_response), "%s", value);
         else { fprintf(stderr, "%s:%d: bad line\n", path, no); exit(1); }
     }
     fclose(f);
@@ -124,6 +136,9 @@ int main(int argc, char **argv) {
     long read_timeout = to_long(conf.read_timeout, 1, 3600, "read_timeout");
     long request_timeout = to_long(conf.request_timeout, 1, 3600, "request_timeout");
     http_init((int)read_timeout, (int)request_timeout);
+    proxy_init((int)to_long(conf.backend_connect_timeout, 1, 3600, "backend_connect_timeout"),
+               (int)to_long(conf.backend_read_timeout, 1, 3600, "backend_read_timeout"),
+               (size_t)to_long(conf.backend_max_response, 1, 64L * 1024 * 1024, "backend_max_response"));
     // 루트는 서버 도는 동안 안 바뀜 → 시작할 때 1번 진짜 경로로 (없으면 포트 열기 전에 종료)
     if (!realpath(conf.root, root)) { perror(conf.root); exit(1); }
     if (load_mime_types(conf.mime_types) < 0) { perror(conf.mime_types); exit(1); }
@@ -142,7 +157,8 @@ int main(int argc, char **argv) {
     int server_fd = open_listen_socket((int)port);
     fcntl(server_fd, F_SETFD, FD_CLOEXEC);   // exec된 CGI 프로그램에 메인 소켓이 따라가지 않게
     if (pool_start((int)workers, (int)queue_size, serve_connection) < 0) { perror("pool_start"); exit(1); }
-    printf("listening on http://localhost:%ld (root: %s, workers %ld, queue %ld)\n", port, root, workers, queue_size);
+    printf("listening on http://localhost:%ld (%s, workers %ld, queue %ld)\n", port,
+           proxy_enabled() ? "reverse proxy" : root, workers, queue_size);
 
     while (1) {
         // 4. accept: 대기열에서 한 명 꺼내 하위 소켓 생성 (없으면 블로킹)

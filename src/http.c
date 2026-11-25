@@ -11,6 +11,7 @@
 
 #include "http.h"
 #include "cgi.h"
+#include "proxy.h"
 #include "static.h"
 
 // 시작 때 1번 정하고 안 바뀜 → 워커들이 읽기만 해서 안전
@@ -168,6 +169,11 @@ void handle_client(int client_fd, const char *root) {
     // 형식은 맞지만 지원 안 하는 버전 (예: HTTP/2.0, HTTP/9.9) → 505
     else if (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0)
         send_response(client_fd, 505, "HTTP Version Not Supported", "HTTP Version Not Supported");
+    // 프록시 모드: 메서드 상관없이 백엔드에 넘김 (판단은 백엔드가). 헤더 = 요청 라인 다음 줄 ~ 빈 줄 앞
+    else if (proxy_enabled()) {
+        const char *headers = strstr(buf, "\r\n") + 2;
+        serve_proxy(client_fd, method, path, headers, header_end + 2 - headers, body, (size_t)content_length);
+    }
     // 어떤 경로에서도 구현 안 한 메서드 → 501 (RFC 9110)
     else if (strcmp(method, "GET") != 0 && strcmp(method, "POST") != 0)
         send_response(client_fd, 501, "Not Implemented", "Not Implemented");
