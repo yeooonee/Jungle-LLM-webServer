@@ -63,4 +63,9 @@ python3 tests/test_http_exceptions.py
 
 [예외 처리 테스트 코드](tests/test_http_exceptions.py)
 
+### 유닛 테스트 및 기능 테스트 검증 완료
+
+- **유닛 테스트** · 임시 C 테스트에서 HTTP 요청 파서, MIME 타입 매핑, 경로별 백엔드 선택을 함수 단위로 검증했습니다. 정상 `GET`·`POST`, `Host` 누락, Round-Robin과 장애 시 대체 서버 선택을 확인했습니다.
+- **기능 테스트** · `curl`로 전체 프록시 경로의 HTML·CSS·PNG 파일 응답, CGI 결과, Round-Robin을 확인했습니다. 동시 연결 32개에서 요청을 두 번씩 보내 총 64건 모두 `200 OK`와 `hello` 응답을 받았습니다.
+
 [상세 구현과 테스트 재현 방법](README2.md) · [HTTP 예외 처리 테스트](tests/test_http_exceptions.py)
