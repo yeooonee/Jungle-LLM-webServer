@@ -44,4 +44,4 @@ bash scripts/demo.sh
 
 C10K에서 같은 Mac의 프록시 여러 구간이 임시 포트를 함께 사용했습니다. 전체 경로 테스트는 임시 포트 범위를 일시적으로 넓혀 통과했고, 종료 후 설정을 복원했습니다.
 
-[상세 구현과 테스트 재현 방법](README_PRESENTATION.md) · [HTTP 예외 처리 테스트](tests/test_http_exceptions.py)
+[상세 구현과 테스트 재현 방법](README2.md) · [HTTP 예외 처리 테스트](tests/test_http_exceptions.py)
