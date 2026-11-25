@@ -20,19 +20,12 @@ POSIX 소켓 API로 HTTP `GET`·`POST`를 처리하는 C 웹 서버를 만들었
 - 원 서버와 두 프록시의 연결 상태 배열은 힙에 할당합니다. 프로세스마다 연결 슬롯은 10,000개입니다.
 
 ```mermaid
-sequenceDiagram
-    participant C as 클라이언트
-    participant L as kqueue 이벤트 루프
-    participant W as pthread 파일 워커 4개
-
-    C->>L: 정적 파일 GET 요청
-    L->>W: 작업 큐에 파일 읽기 등록
-    Note over L: 파일을 읽는 동안 다른 연결 처리
-    W->>W: 파일을 읽고 완료 큐에 결과 저장
-    W-->>L: 파이프로 완료 알림
-    L->>L: 완료 큐에서 결과 확인
-    L-->>C: EVFILT_WRITE에서 헤더와 파일 본문 전송
+flowchart LR
+    A["이벤트 루프<br/>GET 요청 받기"] --> B["파일 워커<br/>파일 읽기"]
+    B -->|완료 알림| C["이벤트 루프<br/>응답 보내기"]
 ```
+
+워커는 파이프로 완료를 알립니다. 이벤트 루프는 `EVFILT_WRITE`에서 HTTP 헤더와 파일 본문을 보냅니다.
 
 ## 데모
 
