@@ -5,7 +5,7 @@ POSIX 소켓 API로 HTTP `GET`·`POST`를 처리하는 C 웹 서버를 만들었
 
 ## 포워드 프록시와 리버스 프록시
 
-![프록시 요청 경로. 로고와 CSS 요청은 포워드 9100을 거쳐 리버스 9200에서 응답합니다. HTML과 CGI 요청은 서버 1과 서버 2로 전달됩니다.](docs/proxy-request-routes-horizontal.png?v=073ef94)
+![프록시 요청 경로. 로고와 CSS 요청은 포워드 9100을 거쳐 리버스 9200에서 응답합니다. HTML과 CGI 요청은 서버 1과 서버 2로 전달됩니다.](https://raw.githubusercontent.com/yeooonee/Jungle-LLM-webServer/bfc37a1186a5dbb3aa6135651c988afb35b2d195/docs/proxy-request-routes-horizontal.png)
 
 ### 포워드 프록시 `9100`
 
