@@ -71,6 +71,25 @@ TCP 송수신은 **`kqueue` 이벤트 루프**가 처리하고, 파일을 열고
 | **`SIGINT` / `SIGTERM`** | `kqueue`에서 종료 신호를 받으면 새 연결 수락을 멈추고 열린 연결을 닫습니다. 원 서버와 리버스는 파일 워커를 정리하고, 원 서버는 CGI 자식 프로세스도 정리합니다. |
 | **`SIGPIPE`** | 쓰기 도중 상대가 끊겨도 서버 프로세스가 종료되지 않도록 이 신호를 무시합니다. 해당 연결의 오류는 `send()`의 반환값으로 처리합니다. |
 
+## HTTP 상태 코드
+
+| 상태 코드 | 반환하는 상황 |
+| --- | --- |
+| `200 OK` | 일반 요청, 정적 파일 요청, CGI 요청 등을 정상 처리했을 때 |
+| `400 Bad Request` | 요청 형식이 잘못됐거나 HTTP/1.1의 `Host`가 빠졌을 때 |
+| `403 Forbidden` | 파일이나 프록시 목적지에 대한 접근이 금지됐거나 원 서버 토큰이 유효하지 않을 때 |
+| `404 Not Found` | 요청한 정적 파일이나 CGI 경로를 찾을 수 없을 때 |
+| `405 Method Not Allowed` | 해당 경로에서 요청 메서드를 지원하지 않을 때 |
+| `413 Content Too Large` | `Content-Length`에 선언된 본문 크기가 64 KiB를 초과할 때 |
+| `417 Expectation Failed` | 요청의 `Expect` 값이 지원 범위를 벗어날 때 |
+| `431 Request Header Fields Too Large` | 요청 라인과 헤더의 합이 8 KiB를 초과할 때 |
+| `500 Internal Server Error` | 파일 읽기나 CGI 실행 등 서버 내부 작업이 실패했을 때 |
+| `501 Not Implemented` | `Content-Length` 없이 `Transfer-Encoding`을 보냈거나 포워드 프록시에 `http://`로 시작하지 않는 URL을 보냈을 때 |
+| `502 Bad Gateway` | 프록시가 다음 서버에 연결하지 못했거나 정상적인 응답을 받지 못했을 때 |
+| `503 Service Unavailable` | 선택할 백엔드가 없거나 파일 작업 큐가 가득 찼을 때 |
+| `504 Gateway Timeout` | 프록시가 다음 서버의 응답을 제시간에 받지 못했거나 CGI 실행 시간이 초과됐을 때 |
+| `505 HTTP Version Not Supported` | HTTP/1.2처럼 지원하지 않는 HTTP 버전을 요청했을 때 |
+
 ## 데모
 
 프로젝트 루트에서 실행합니다. 스크립트가 데모 서버를 빌드해 띄우고, 각 단계는 Enter를 누르면 진행됩니다.
